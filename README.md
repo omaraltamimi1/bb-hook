@@ -1,0 +1,2 @@
+# bb-hook
+hook test
