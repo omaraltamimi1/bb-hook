@@ -1,4 +1,6 @@
 #!/bin/sh
 # Intentionally a no-op. Repository-managed Git hooks must not collect or
 # persist host or process data as a side effect of checking out code.
+#!/usr/bin/env bash
+# Intentionally inert. Repository hooks must never collect host or environment data.
 exit 0
