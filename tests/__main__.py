@@ -32,6 +32,23 @@ class Integration(unittest.TestCase):
  def test_resume_no_duplicates(self):
   with tempfile.TemporaryDirectory() as d:
    self.assertEqual(self.run_cli('example.com','--dry-run','--only','dns','--output-dir',d).returncode,0); rid=(Path(d)/'last').read_text(); self.assertEqual(self.run_cli('example.com','--dry-run','--only','dns','--resume',rid,'--output-dir',d).returncode,0); lines=(Path(d)/rid/'raw-artifacts/dns/normalized.txt').read_text().splitlines();self.assertEqual(lines,['example.com'])
+ def test_subdomains_flow_to_dnsx_httpx_and_ports(self):
+  with tempfile.TemporaryDirectory() as d:
+   b=Path(d)/'bin';b.mkdir()
+   scripts={
+    'subfinder':'#!/bin/sh\nprintf "api.example.com\\nwww.example.com\\n"\n',
+    'dnsx':'#!/bin/sh\ncat "$(printf "%s\\n" "$@" | tail -1)"\n',
+    'httpx':'#!/bin/sh\nwhile read h; do printf "https://%s/\\n" "$h"; done < "$(printf "%s\\n" "$@" | tail -1)"\n',
+    'naabu':'#!/bin/sh\nwhile read h; do printf "%s:443\\n" "$h"; done < "$(printf "%s\\n" "$@" | tail -1)"\n',
+   }
+   for name,body in scripts.items(): p=b/name;p.write_text(body);p.chmod(0o755)
+   env=os.environ.copy();env['PATH']=str(b)+os.pathsep+env['PATH']
+   r=self.run_cli('example.com','--only','subdomains,dnsx,httpx,ports','--output-dir',d,env=env);self.assertEqual(r.returncode,0,r.stderr)
+   rid=(Path(d)/'last').read_text();raw=Path(d)/rid/'raw-artifacts'
+   expected={'api.example.com','www.example.com','example.com'}
+   self.assertEqual(set((raw/'dnsx/normalized.txt').read_text().splitlines()),expected)
+   self.assertEqual(set((raw/'httpx/normalized.txt').read_text().splitlines()),{f'https://{h}/' for h in expected})
+   self.assertEqual(set((raw/'ports/normalized.txt').read_text().splitlines()),{f'{h}:443' for h in expected})
  def test_stage_global_timeout_partial(self):
   with tempfile.TemporaryDirectory() as d:
    r=self.run_cli('example.com','--only','api-discovery','--request-timeout','.1','--stage-timeout','.001','--global-timeout','.001','--output-dir',d);self.assertNotEqual(r.returncode,0);run=next(p for p in Path(d).iterdir() if p.is_dir());self.assertTrue((run/'report.json').exists())
