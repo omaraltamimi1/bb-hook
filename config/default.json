@@ -1,0 +1,7 @@
+{
+  "profile": "balanced",
+  "strict_scope": true,
+  "graphql_introspection": false,
+  "heartbeat_seconds": 30,
+  "kill_grace_seconds": 5
+}

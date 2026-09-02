@@ -1,0 +1,13 @@
+[project]
+name = "autorecon-raccoon-4k"
+version = "8.0.0"
+requires-python = ">=3.11"
+[project.scripts]
+autorecon = "autorecon_v8.cli:main"
+[tool.ruff]
+line-length = 180
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+[tool.ruff.lint]
+ignore = ["E701", "E702", "E401", "F401"]
