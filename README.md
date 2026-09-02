@@ -1,112 +1,60 @@
-# bb-hook
+# AutoRecon v8 — Raccoon 4K
 
-This repository contains a safe, no-op `post-checkout` hook fixture.
+A Python 3.11+ reconnaissance orchestrator for authorized assessments. V8 prioritizes strict scope decisions, bounded execution, atomic resumability, process-group shutdown, observable progress, and preservation of raw evidence. The archived v7 implementation is never invoked.
 
-The hook must not read or persist host data, account information, environment
-variables, credentials, tokens, or other process secrets. In particular, a
-checkout hook runs outside the application's TLS boundary, so collecting that
-data would be a separate local sensitive-data exposure rather than evidence of
-impact from a remote certificate hostname mismatch.
-
-## Verification
-
-Run the following checks from the repository root:
-
-```sh
-sh -n y/hooks/post-checkout
-tmpdir="$(mktemp -d)"
-(
-  cd "$tmpdir"
-  /workspace/bb-hook/y/hooks/post-checkout old-ref new-ref 1
-)
-test -z "$(find "$tmpdir" -mindepth 1 -print -quit)"
-rm -rf "$tmpdir"
-# AutoRecon V7.3.0
-
-`autorecon.sh` is a one-file reconnaissance and attack-surface orchestrator for
-a domain, IPv4 address, or HTTP(S) URL. It preserves raw discovery evidence,
-keeps unfiltered raw evidence alongside normalized views, and publishes an atomic TXT
-report with explicit status for every stage.
-
-## Highlights
-
-- Multi-source host/DNS discovery with an isolated RFC1918/SSRF corpus.
-- Raw mode is the default: external discoveries, private targets, HTTP duplicates,
-  raw headers/bodies, and all FFUF response codes remain available as evidence.
-- Deduplicated HTTPX reachability, details, technology correlation, and optional screenshots.
-- Authenticated crawling and probing via repeatable `--header` and `--cookie` options.
-- Authentication material is redacted; configuration is not reported as proof of login.
-  Optional validation requires a 401/403-to-2xx authenticated differential.
-- Scoped multi-host Naabu/Nmap scanning with partial-output preservation.
-- Automatic SecLists detection plus bounded recursive and parameter FFUF.
-- Classified JavaScript secret evidence and passive gRPC-Web service/method extraction.
-- Signature-validated OpenAPI/Swagger results, separate protected/uncertain candidates,
-  optional GraphQL introspection, realm-aware read-only SCIM/OIDC/Keycloak discovery,
-  and validated public JavaScript source-map discovery.
-- Stage status records distinguish completed, partial, failed, and skipped runs.
-- TLS certificate/SAN expansion plus read-only robots, sitemap, security.txt,
-  CORS, CSP, cookie, redirect, accidental metadata, and security-header collection.
-# AutoRecon
-
-`autorecon.sh` is a one-file bug-bounty reconnaissance and attack-surface
-orchestrator for a domain, IPv4 address, or HTTP(S) URL. V7 runs the complete
-workflow by default and publishes every artifact into one atomic text report.
-
-## Highlights
-
-- Strict target parsing, including complete IPv4 octet validation.
-- Non-interactive `--auto`, network-free `--dry-run`, and optional `--passive` modes.
-- Multi-source discovery with Subfinder, Assetfinder, Amass, DNSx, GAU and Waybackurls.
-- HTTP fingerprinting, Naabu/Nmap ports, Katana crawling, Arjun parameter discovery,
-  FFUF content discovery and Nuclei scanning.
-- JavaScript downloads with offline endpoint and hardcoded-secret extraction.
-- Full endpoint corpus plus additional parameterized and high-value triage views;
-  discovery results are not removed from the complete corpus.
-- 401/403 header and path differential checks with complete response metrics.
-- Per-command timeouts, failure isolation, signal-safe cleanup, and an execution log.
-- Atomic report publication prevents interrupted runs from leaving partial results.
-
-## Usage
+## Install
 
 ```bash
-./autorecon.sh --auto example.com
-./autorecon.sh --auto --dry-run https://example.com/path
-./autorecon.sh --auto --header 'Authorization: Bearer REAL_TOKEN' \
-  --cookie 'session=REAL_VALUE' example.com
-FFUF_WORDLIST=/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt \
-PARAM_WORDLIST=/usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt \
-  ./autorecon.sh --auto example.com
-./autorecon.sh --auto --screenshots example.com
-./autorecon.sh --passive example.com
-./autorecon.sh --strict-scope --exclude-private --auto example.com
+python3 -m pip install -e .
+# or run without installation
+./autorecon --list-stages
 ```
 
-Raw mode is enabled by default and does not discard external discoveries, private
-DNS targets, duplicate HTTP evidence, or non-matching FFUF responses. Use
-`--strict-scope` and/or `--exclude-private` when you want an intentionally reduced
-operational target set. Rate, time, recursion, file-size, and target caps remain
-configurable resource bounds rather than evidence filters.
+No runtime Python dependency outside the standard library is required. External tools are optional: a missing tool produces an explicit skipped stage rather than a false empty result.
 
-Set `AUTH_CHECK_URL` to a safe in-scope endpoint when you want the report to
-record whether authentication changes a 401/403 response to 2xx. The report never
-prints authentication values. Screenshots are saved next to the TXT report;
-`SCREENSHOT_BASELINE` can point to an earlier SHA-256 manifest for change detection.
-./autorecon.sh example.com
-./autorecon.sh --auto --dry-run https://example.com/path
-FFUF_WORDLIST=/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt \
-  ./autorecon.sh --auto --output-dir ./reports example.com
-./autorecon.sh --passive example.com
-```
-
-Run `./autorecon.sh --help` for environment and rate overrides.
-
-## Checks
+## Run
 
 ```bash
-bash -n autorecon.sh
-shellcheck autorecon.sh tests/smoke.sh
-./tests/smoke.sh
-# The removed scanner integration should have no project references.
-shellcheck autorecon.sh
-./tests/smoke.sh
+./autorecon wellsfargo.com --auto --active --strict-scope --profile balanced \
+  --skip nmap,ffuf --output-dir /mnt/KaliShare/autorecon-results
+./autorecon example.com --passive --profile passive
+./autorecon example.com --only dns,httpx,api-discovery
+./autorecon example.com --from crawl --until javascript
+./autorecon example.com --resume last --output-dir ./autorecon-results
+./autorecon example.com --resume RUN_ID --restart-stage api-discovery
 ```
+
+Selection controls are `--only`, `--skip`, `--from`, `--until`, and `--list-stages`. Runtime controls are `--request-timeout`, `--tool-timeout`, `--stage-timeout`, `--global-timeout`, `--max-hosts`, `--concurrency`, `--rate-limit`, `--heartbeat`, and `--kill-grace`. CLI values override profile defaults. `--dry-run` performs no subprocess/network work while exercising stages and reports.
+
+## Profiles
+
+| Profile | Concurrency | Rate/s | Request | Tool | Stage | Max hosts | Selection |
+|---|---:|---:|---:|---:|---:|---:|---|
+| passive | 4 | 5 | 10s | 300s | 600s | 500 | passive stages only |
+| fast | 8 | 20 | 8s | 300s | 600s | 200 | screenshots/nmap/ffuf off |
+| balanced | 10 | 15 | 12s | 900s | 1800s | 1000 | all |
+| deep | 20 | 10 | 20s | 1800s | 7200s | 5000 | all |
+| custom | 4 | 5 | 10s | 600s | 1200s | 500 | all |
+
+## Evidence and reliability
+
+Each run uses mode `0700` and contains `run-state.json` (atomically replaced), `raw-artifacts/`, `commands.jsonl`, `scope-decisions.jsonl`, `report.md`, `report.json`, and `stages.csv`. Raw responses are not treated as findings; reports explicitly separate evidence from vulnerability claims. API discovery deduplicates origins, performs read-only OpenAPI/Swagger, GraphQL, SCIM Users/Groups, OIDC and Keycloak probes, and gives every response a unique body file. GraphQL introspection is off unless `--graphql-introspection` is supplied and never sends a mutation.
+
+Child tools start in new process groups. Signals and deadlines stop scheduling work, terminate the group, escalate after `--kill-grace`, checkpoint, publish a partial report, retain evidence, print an exact resume command, and return nonzero. Heartbeats default to 30 seconds (below the one-minute acceptance ceiling).
+
+## Scope
+
+`--strict-scope` permits the seed and its subdomains. Repeat `--scope-include` and `--scope-exclude` for additional wildcard-style suffix rules; exclusions win. Every operational decision is logged. Redirect destinations are checked as new URLs before operational use.
+
+## Development checks
+
+```bash
+python3 -m tests
+python3 -m compileall -q autorecon_v8 tests
+ruff check .
+mypy autorecon_v8
+shellcheck autorecon
+./autorecon example.com --dry-run --skip nmap,ffuf --output-dir /tmp/autorecon-smoke
+```
+
+See [migration notes](docs/MIGRATION-v7.md), [v8 changelog](CHANGELOG-v8.md), [default configuration](config/default.json), and [scope example](config/scope.example.txt).

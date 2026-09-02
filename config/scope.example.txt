@@ -1,0 +1,3 @@
+# Seed and subdomains are included. Prefix an exclusion with !.
+example.com
+!admin.example.com
