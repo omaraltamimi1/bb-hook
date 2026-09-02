@@ -195,8 +195,14 @@ class Runner:
         except Interrupted: st.status="interrupted"; st.exit_code=130; st.failure_reason="signal received"; st.resume="retry remaining units"; raise
         finally: st.ended_at=now(); st.runtime_seconds=round(time.monotonic()-start,3); self.save(); self.current=None
     def inputs(self,sid:str)->list[str]:
-        mapping={"dnsx":[self.host],"tls":[self.host],"httpx":[self.seed],"screenshots":self.read("httpx"),"ports":[self.host],"crawl":self.read("httpx"),"archives":[self.host],"corpus":self.read("crawl")+self.read("archives"),"javascript":self.read("corpus"),"api-discovery":self.read("httpx") or [self.seed],"web-intelligence":self.read("httpx"),"arjun":self.read("corpus"),"nmap":self.read("ports"),"ffuf":self.read("httpx"),"access-checks":self.read("corpus")}
-        return mapping.get(sid,[self.host])[:self.args.max_hosts]
+        discovered=self.read("subdomains")
+        resolved=self.read("dnsx")
+        hosts=resolved or discovered or [self.host]
+        mapping={"dnsx":discovered+[self.host],"tls":hosts,"httpx":hosts,"screenshots":self.read("httpx"),"ports":hosts,"crawl":self.read("httpx"),"archives":discovered+[self.host],"corpus":self.read("crawl")+self.read("archives"),"javascript":self.read("corpus"),"api-discovery":self.read("httpx") or [self.seed],"web-intelligence":self.read("httpx"),"arjun":self.read("corpus"),"nmap":self.read("ports"),"ffuf":self.read("httpx"),"access-checks":self.read("corpus")}
+        values=[]
+        for value in mapping.get(sid,[self.host]):
+            if value and value not in values and self.scope.decide(value)[0]: values.append(value)
+        return values[:self.args.max_hosts]
     def read(self,sid:str)->list[str]:
         p=self.raw/sid/"normalized.txt"; return p.read_text().splitlines() if p.exists() else []
     def generic_stage(self,st:StageState,deadline:float)->None:
@@ -206,7 +212,9 @@ class Runner:
         if tool and not shutil.which(tool): st.status="skipped"; st.failure_reason=f"missing external tool: {tool}"; return
         if self.args.dry_run: self.write_lines(dest,values); st.processed=st.total; return
         # Safe bounded adapters; raw stdout remains separate from normalized evidence.
-        cmds={"dns":[tool,"+short",self.host],"subdomains":[tool,"-silent","-d",self.host],"dnsx":[tool,"-silent"],"tls":[tool,"-silent","-host",self.host],"httpx":[tool,"-silent","-u",self.seed],"ports":[tool,"-silent","-host",self.host],"archives":[tool,self.host]}
+        input_file=self.raw/st.id/"inputs.txt"
+        self.write_lines(input_file,values)
+        cmds={"dns":[tool,"+short",self.host],"subdomains":[tool,"-silent","-d",self.host],"dnsx":[tool,"-silent","-l",str(input_file)],"tls":[tool,"-silent","-l",str(input_file)],"httpx":[tool,"-silent","-l",str(input_file)],"ports":[tool,"-silent","-list",str(input_file)],"archives":[tool,"--subs",self.host]}
         if st.id in cmds:
             raw=self.raw/st.id/"stdout.txt"; rc=self.command(st.id,[str(x) for x in cmds[st.id]],values[0],deadline,raw); st.exit_code=rc
             lines=raw.read_text(errors="replace").splitlines() if raw.exists() else []

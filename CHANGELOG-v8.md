@@ -1,5 +1,10 @@
 # AutoRecon v8 changelog
 
+## Unreleased
+
+* Fixed stage data flow so discovered subdomains are resolved and passed to TLS, HTTP, port, and archive collection instead of scanning only the seed host.
+* Switched bulk ProjectDiscovery adapters to explicit input files, preventing `dnsx` from starting without any stdin.
+
 ## 8.0.0 — Raccoon 4K
 
 * Replaced the monolithic runtime with a Python 3.11 stage engine and process-group supervisor.
