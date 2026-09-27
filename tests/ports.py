@@ -134,6 +134,44 @@ class TestChunking(TestPortsUnits):
         self.assertIn("chunk 2/4", st.failure_reason or "")
         self.assertEqual(st.exit_code, 1)
 
+    def test_a_killed_chunk_keeps_the_ports_it_had_already_found(self):
+        """naabu streams results, so a chunk killed at the tool timeout still found real ports.
+
+        This is the exact shape of the whatnot run that failed: stdout held 275 open ports while the
+        stage recorded processed=0 and reported nothing, because the results were only parsed after
+        the invocation returned. A kill is the normal case for a slow sweep, not the exception, and
+        the ports found before it are the ones worth having.
+        """
+        calls = {"n": 0}
+
+        def killed_midway(stage, cmd, target, deadline, output, cwd=None):
+            if "-list" not in cmd:
+                Path(output).parent.mkdir(parents=True, exist_ok=True); Path(output).write_text("")
+                return 0
+            calls["n"] += 1
+            hosts = [l for l in Path(str(cmd[-1])).read_text().splitlines() if l.strip()]
+            if calls["n"] == 2:
+                # 60 seconds of real output, then the process is gone.
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("".join(f"{h}:{p}\n" for h in hosts for p in (80, 443)))
+                return 124                     # killed at the tool timeout
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("".join(f"{h}:443\n" for h in hosts))
+            return 0
+
+        self.run.command = killed_midway
+        st = self.stage([f"h{i}.example.com" for i in range(90)])
+        lines = self.result()
+        self.assertTrue(lines, "a killed chunk's results were thrown away with the chunk")
+        self.assertEqual(st.status, "partial", "a killed chunk was reported as a clean stage")
+        self.assertIn("chunk 2/4", st.failure_reason or "")
+        # chunk 2's hosts must be present even though that invocation never returned cleanly
+        self.assertIn("h25.example.com:443", lines,
+                      "the killed chunk's own findings were discarded")
+        # chunks are 25/25/25/15 and chunk 2 is the killed one: 25 + (25x2) + 25 + 15 = 115
+        self.assertEqual(len(lines), 25 + 50 + 25 + 15,
+                         f"the surviving chunks changed the count: {len(lines)} lines")
+
     def test_the_chunk_size_is_configurable(self):
         self.run = build(self.tmp, ("--tool-timeout", "300", "--ports-chunk", "50"))
         harness = BudgetHarness(per_host=2.0); harness.stage_tool_timeout = 300.0
