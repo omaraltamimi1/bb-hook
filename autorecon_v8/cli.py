@@ -1,9 +1,10 @@
 from __future__ import annotations
 import argparse, sys
+from . import __version__
 from .core import PROFILES, STAGE_IDS, Runner
 
 def parser():
- p=argparse.ArgumentParser(prog="autorecon",description="AutoRecon v8 — Raccoon 4K")
+ p=argparse.ArgumentParser(prog="autorecon",description=f"AutoRecon v{__version__} — Raccoon 4K")
  p.add_argument("target",nargs="?"); p.add_argument("--list-stages",action="store_true"); p.add_argument("--only",action="append"); p.add_argument("--skip",action="append"); p.add_argument("--from",dest="from_stage",choices=STAGE_IDS); p.add_argument("--until",choices=STAGE_IDS); p.add_argument("--resume"); p.add_argument("--restart-stage",choices=STAGE_IDS); p.add_argument("--keep-temp",action="store_true"); p.add_argument("--active",action="store_true"); p.add_argument("--passive",action="store_true"); p.add_argument("--dry-run",action="store_true"); p.add_argument("--auto",action="store_true");p.add_argument("--strict-stages",action="store_true",help="exit 2 if an unimplemented stage is scheduled to run");p.add_argument("--crawl-depth",type=int,default=3,help="maximum crawl depth (default: 3)");p.add_argument("--cookie-file",help="identity A: a Cookie header, an Authorization header, a cookie line, or a curl command");p.add_argument("--cookie-file-b",help="identity B, for a cross-role differential; omit for anon-vs-auth only");p.add_argument("--access-checks-max",type=int,default=0,help="cap access-checks targets; 0=default 40");p.add_argument("--arjun-max",type=int,default=0,help="cap arjun targets; 0=default 15");
  p.add_argument("--no-kali-share",action="store_true",help="do not mirror result.txt to the shared evidence mount");
  p.add_argument("--web-intel-max",type=int,default=0,help="cap web-intelligence pages; 0=default 40");
