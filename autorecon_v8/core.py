@@ -863,7 +863,7 @@ class Runner:
                 while p.poll() is None:
                     self.check(min(deadline,start+self.args.tool_timeout))
                     if time.monotonic()>=next_beat:
-                        print(f"[{stage}] tool={cmd[0]} PID={p.pid} target={target} elapsed={fmt(time.monotonic()-start)} deadline={fmt(max(0,min(deadline,start+self.args.tool_timeout)-time.monotonic()))}",flush=True); next_beat=time.monotonic()+min(30,self.args.heartbeat)
+                        print(f"[{stage}] tool={cmd[0]} PID={p.pid} target={target} elapsed={fmt_ms(time.monotonic()-start)} deadline={fmt(max(0,min(deadline,start+self.args.tool_timeout)-time.monotonic()))}",flush=True); next_beat=time.monotonic()+min(30,self.args.heartbeat)
                     time.sleep(.1)
                 if self.stop.is_set(): raise Interrupted()
                 return int(p.returncode or 0)
@@ -1605,7 +1605,7 @@ class Runner:
                     local.append({"origin":o,"probe":name,"url":urljoin(o,path),"status":resp.status,"bytes":len(data),"body":str(p),"timestamp":now()})
                 except (OSError,http.client.HTTPException) as e: local.append({"origin":o,"probe":name,"error":str(e),"timestamp":now()})
                 finally: conn.close()
-            with lock: results.extend(local); st.processed+=1; self.save(); print(f"[api-discovery] {st.processed}/{st.total} {o} | elapsed={fmt(time.monotonic()-(deadline-self.args.stage_timeout))} | ETA={eta(st.processed,st.total,st.runtime_seconds)}",flush=True)
+            with lock: results.extend(local); st.processed+=1; self.save(); print(f"[api-discovery] {st.processed}/{st.total} {o} | elapsed={fmt_ms(time.monotonic()-(deadline-self.args.stage_timeout))} | ETA={eta(st.processed,st.total,st.runtime_seconds)}",flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.args.concurrency) as ex:
             futures=[]
             for i,o in enumerate(origins): self.check(deadline); futures.append(ex.submit(one,i,o))
@@ -1835,6 +1835,16 @@ class Runner:
 
 def fmt(sec:float)->str:
     sec=max(0,int(sec)); return f"{sec//3600:02d}:{sec%3600//60:02d}:{sec%60:02d}"
+def fmt_ms(sec:float)->str:
+    """Sub-second resolution, for the per-unit heartbeat.
+
+    fmt() truncates to whole seconds, which is right for a stage budget and useless for a single
+    unit: every dig, every httpx probe and every arjun request finished under a second and printed
+    elapsed=00:00:00, so the line could not tell a 20ms answer from a unit that hung until it was
+    killed from a tool that never started. That is the only per-unit visibility a live run has, and
+    it is the line an operator reads when a stage looks stuck.
+    """
+    sec=max(0,float(sec)); return f"{sec*1000:.0f}ms" if sec<1 else fmt(sec)
 def eta(done:int,total:int,elapsed:float)->str: return fmt((elapsed/max(done,1))*(total-done))
 def csvset(values:list[str]|None)->set[str]: return {x for v in values or [] for x in v.split(",") if x}
 def select_stages(args:argparse.Namespace)->tuple[set[str],dict[str,str]]:

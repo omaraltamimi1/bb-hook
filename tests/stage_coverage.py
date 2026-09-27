@@ -56,6 +56,48 @@ def flag(cmd, name):
     return None
 
 
+class TestUnitTiming(unittest.TestCase):
+    """The heartbeat is the only per-unit visibility a live run has.
+
+    A first run against a real host printed elapsed=00:00:00 for every single unit, because fmt()
+    truncates to whole seconds and every tool answered in under one. That made a 20ms response, a
+    unit killed on timeout and a tool that never launched all look identical.
+    """
+
+    def test_a_sub_second_unit_is_visible(self):
+        from autorecon_v8.core import fmt, fmt_ms
+        self.assertEqual(fmt(0.04), "00:00:00", "fmt is the second-resolution formatter")
+        self.assertEqual(fmt_ms(0.04), "40ms")
+        self.assertEqual(fmt_ms(0.5), "500ms")
+        self.assertEqual(fmt_ms(0.999), "999ms")
+
+    def test_ms_never_says_zero_for_a_unit_that_ran(self):
+        """0ms must mean started-this-instant, never a unit that did real work.
+
+        A regression to second resolution turns every fast unit into 00:00:00, which is the exact
+        failure this formatter exists to prevent.
+        """
+        from autorecon_v8.core import fmt_ms
+        for seconds in (0.001, 0.02, 0.1, 0.25, 0.75, 0.999):
+            self.assertNotEqual(fmt_ms(seconds), "00:00:00",
+                                f"a {seconds}s unit is indistinguishable from no unit at all")
+
+    def test_durations_beyond_a_second_are_unchanged(self):
+        from autorecon_v8.core import fmt, fmt_ms
+        for seconds in (1.0, 12.4, 599.2, 3661.0):
+            self.assertEqual(fmt_ms(seconds), fmt(seconds),
+                             "a long duration should read the same as it always did")
+
+    def test_the_heartbeat_line_uses_the_sub_second_formatter(self):
+        """Guards the call site, not just the helper."""
+        import inspect
+        from autorecon_v8 import core
+        source = inspect.getsource(core.Runner.command)
+        self.assertNotIn("elapsed={fmt(", source, "the per-unit heartbeat is back on fmt()")
+        self.assertIn("elapsed={fmt_ms(", source)
+
+
+
 class Harness(unittest.TestCase):
     """Builds a Runner over a temp run directory and records the argv of every subprocess."""
 
