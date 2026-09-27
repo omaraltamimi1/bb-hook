@@ -15,6 +15,17 @@ def parser():
  p.add_argument("--ffuf-wordlist",help="ffuf wordlist; falls back to seclists common.txt then config/sensitive-paths.txt");p.add_argument("--arjun-delay",type=float,default=0,help="seconds between arjun requests");p.add_argument("--arjun-passive",action="store_true",help="collect parameter names from passive sources only, without active probing");p.add_argument("--arjun-wordlist",help="arjun parameter wordlist; defaults to the bundled one"); p.add_argument("--strict-scope",action="store_true"); p.add_argument("--scope-include",action="append",default=[]); p.add_argument("--scope-exclude",action="append",default=[])
  p.add_argument("--profile",choices=PROFILES,default="balanced"); p.add_argument("--output-dir",default="./autorecon-results"); p.add_argument("--request-timeout",type=float); p.add_argument("--tool-timeout",type=float); p.add_argument("--stage-timeout",type=float); p.add_argument("--global-timeout",type=float,default=0); p.add_argument("--max-hosts",type=int); p.add_argument("--concurrency",type=int); p.add_argument("--rate-limit",type=float); p.add_argument("--kill-grace",type=float,default=5); p.add_argument("--heartbeat",type=float,default=30); p.add_argument("--graphql-introspection",action=argparse.BooleanOptionalAction,default=False)
  return p
+LIMIT_KEYS=("request_timeout","tool_timeout","stage_timeout","max_hosts","concurrency","rate_limit")
+def apply_profile_defaults(a):
+ """Fill unset limits from the active profile and return the args.
+
+ Extracted so tests can build an args object exactly the way main() does. Several stages call
+ int(self.args.request_timeout) directly, so an args object that skipped this raised TypeError on
+ None instead of defaulting - a latent trap for any programmatic caller, not only for tests.
+ """
+ for key in LIMIT_KEYS:
+  if getattr(a,key,None) is None:setattr(a,key,PROFILES[a.profile][key])
+ return a
 def main(argv=None):
  p=parser(); a=p.parse_args(argv)
  if a.list_stages:
@@ -23,8 +34,7 @@ def main(argv=None):
   return 0
  if not a.target:p.error("target is required unless --list-stages is used")
  defaults=PROFILES[a.profile]
- for key in ("request_timeout","tool_timeout","stage_timeout","max_hosts","concurrency","rate_limit"):
-  if getattr(a,key) is None:setattr(a,key,defaults[key])
+ apply_profile_defaults(a)
  if min(a.request_timeout,a.tool_timeout,a.stage_timeout,a.max_hosts,a.concurrency,a.rate_limit)<=0:p.error("limits must be positive")
  try:return Runner(a).run()
  except (ValueError,OSError) as e: print(f"autorecon: error: {e}",file=sys.stderr); return 2
