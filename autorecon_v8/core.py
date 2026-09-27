@@ -755,10 +755,26 @@ def with_params(url: str, names: list[str]) -> str:
 # candidate and the report says so. Ranking exists to put a human's next click in the right place.
 UNUSUAL_PORTS={21,22,23,25,110,143,445,1433,1521,2049,2375,3000,3306,3389,4369,5000,5432,5601,5672,5900,5984,6379,6443,8000,8008,8080,8081,8443,8888,9000,9200,11211,27017,28017}
 HUNT_LIMIT=80
+# result.txt is read by a person, not parsed. 40 keeps a large target's sections scannable; the
+# hunt queue in result.md is the exhaustive ranked list, so nothing is only available there.
+RESULT_SECTION_CAP=40
 HUNT_SENSITIVE=re.compile(r"(?:\.env|wp-config\.php|wp-login|/phpmyadmin|/admin(?:/|$)|/_cat/|/actuator|/\.git/|/\.git$|/\.aws/|/\.ssh/|/server-status|/\.DS_Store|/config\.(?:json|ya?ml|ini)|/backup|/dump|/sql|/internal|/private|/\.svn/|/cgi-bin/)",re.IGNORECASE)
 # Lower sorts first. An authorization candidate outranks an open port because it is the only entry
 # on this list that can represent cross-account data exposure.
 HUNT_RANK={"access-candidate":0,"sensitive-path":1,"unusual-port":1,"discovered-endpoint":2,"discovered-path":2,"live-host":3,"open-port":4,"javascript":5}
+
+def host_of(v:str)->str:
+    return (urlsplit(v if "://" in v else "//"+v).hostname or "").lower()
+
+def rank_hunt(values:Iterable[str])->list[str]:
+    """Order candidates the way hunt_queue() orders them: sensitive-looking first, then shortest.
+
+    Shortest because a specific path beats a wildcard one for deciding where to look next. One
+    definition, because result.txt and the hunt queue disagreeing about what matters is how a
+    duplicated ranking rule goes stale.
+    """
+    return sorted({v.strip() for v in values if v and v.strip()},
+                  key=lambda v:(0 if HUNT_SENSITIVE.search(v) else 1,len(v),host_of(v),v))
 
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
@@ -1785,13 +1801,26 @@ class Runner:
         that was not there. Everything in it is a candidate, never a validated vulnerability.
         """
         sep="="*72; sep2="-"*72
-        def section(title:str,lines:list[str])->list[str]:
-            return ["",f"[{title}]"]+lines if lines else []
+        def section(title:str,lines:list[str],cap:int=RESULT_SECTION_CAP)->list[str]:
+            """
+            A capped section, and it says so when it truncates.
+
+            Uncapped, [SUBDOMAINS] on a real target is several hundred lines and the two things worth
+            reading are somewhere inside it. The cap is the same promise the hunt queue already makes,
+            and "312 of 312 shown" is what keeps a truncated section from reading as a complete one -
+            a section that silently drops rows is indistinguishable from a target with none.
+            """
+            if not lines: return []
+            if len(lines)<=cap: return ["",f"[{title}]"]+lines
+            return ["",f"[{title}]"]+lines[:cap]+[f"  ... {len(lines)} of {len(lines)} shown"]
         def read_stage(sid:str)->list[str]:
             return [l.strip() for l in self.read(sid) if l.strip() and not l.strip().startswith(";")]
 
         dns=read_stage("dns")
         subdomains=sorted(set(read_stage("subdomains")+read_stage("dnsx")))
+        # Ranked the way the hunt queue ranks: anything that looks like a sensitive path first, then
+        # shortest, so a 400-line host list leads with the entries a human would chase.
+        subdomains=rank_hunt(subdomains)
         live=read_stage("httpx")
         ports=read_stage("ports")
         # hunt_queue(), not a fresh regex over corpus: the queue is the ranked, deduped, capped view
@@ -1943,12 +1972,7 @@ class Runner:
             seen.add(value)
             items.append({"value":value,"why":why,"stage":stage,"rank":str(HUNT_RANK.get(why,9)),
                           "active":str(stage in ACTIVE)})
-        def host_of(v:str)->str:
-            return (urlsplit(v if "://" in v else "//"+v).hostname or "").lower()
-        def ordered(values:Iterable[str])->list[str]:
-            # Sensitive-looking values first, then shortest, so the most specific path leads.
-            return sorted({v.strip() for v in values if v and v.strip()},
-                          key=lambda v:(0 if HUNT_SENSITIVE.search(v) else 1,len(v),host_of(v),v))
+        def ordered(values:Iterable[str])->list[str]: return rank_hunt(values)
 
         ac=self.raw/"access-checks"
         if (ac/"anomalies.tsv").exists():

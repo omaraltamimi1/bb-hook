@@ -53,6 +53,7 @@ def seed(run, stages):
     return raw
 
 
+from pathlib import Path
 class AtomicText(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -315,5 +316,80 @@ class ResultTxt(unittest.TestCase):
         self.assertNotIn("session=", cmd, "a live credential was inlined into the resume command")
 
 
+class TestResultTxtIsCappedAndRanked(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+        self.run = build(self.tmp)
+
+    def runner(self):
+        return self.run
+
+    """[SUBDOMAINS] on a real target is several hundred lines, and the entries worth reading are
+    buried inside it. A cap that does not announce itself is indistinguishable from a target that has
+    nothing, so the announcement is part of the feature, not a nicety."""
+
+    def build_with_subdomains(self, values):
+        run = self.runner()
+        path = Path(run.raw) / "subdomains" / "normalized.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(values) + "\n")
+        run.generate_reports(0)
+        return (Path(run.work) / "result.txt").read_text()
+
+    def test_a_large_section_is_capped(self):
+        from autorecon_v8.core import RESULT_SECTION_CAP
+        text = self.build_with_subdomains([f"host{i}.example.com" for i in range(300)])
+        block = text.split("[SUBDOMAINS]", 1)[1].split("[", 1)[0]
+        rows = [l for l in block.splitlines() if ".example.com" in l]
+        self.assertEqual(len(rows), RESULT_SECTION_CAP, "the section is not capped")
+
+    def test_a_capped_section_says_how_many_were_dropped(self):
+        text = self.build_with_subdomains([f"host{i}.example.com" for i in range(300)])
+        block = text.split("[SUBDOMAINS]", 1)[1].split("[", 1)[0]
+        self.assertIn("300 of 300 shown", block,
+                      "a truncated section must say so, or a partial list reads as a complete one")
+
+    def test_a_short_section_is_not_annotated(self):
+        text = self.build_with_subdomains(["a.example.com", "b.example.com"])
+        block = text.split("[SUBDOMAINS]", 1)[1].split("[", 1)[0]
+        self.assertNotIn("shown", block, "a complete section does not need a truncation notice")
+
+    def test_the_sensitive_entry_ranks_first(self):
+        text = self.build_with_subdomains([f"host{i}.example.com" for i in range(300)]
+                                          + ["admin.example.com/wp-login.php"])
+        block = text.split("[SUBDOMAINS]", 1)[1].split("[", 1)[0]
+        rows = [l.strip() for l in block.splitlines() if ".example.com" in l]
+        self.assertIn("wp-login", rows[0],
+                      "a login path is the one entry here worth reading and it was truncated away")
+
+    def test_the_queue_and_result_txt_cannot_drift_apart(self):
+        """hunt_queue had its own copy of this ordering. Two copies is one too many, and nothing
+        caught it when they diverged - the copies were byte-identical when written and nothing held
+        them there. The call site is asserted so the duplication cannot come back."""
+        import inspect
+        source = inspect.getsource(core_module.Runner.hunt_queue)
+        self.assertIn("return rank_hunt(values)", source,
+                      "hunt_queue grew a private ordering again; result.txt and report.md would "
+                      "disagree about what matters")
+        self.assertNotIn("key=lambda v:(0 if HUNT_SENSITIVE.search(v)", source)
+
+    def test_result_txt_and_the_hunt_queue_rank_identically(self):
+        """Two orderings of 'what matters' is how a duplicated ranking rule goes stale."""
+        from autorecon_v8.core import rank_hunt
+        values = [f"host{i}.example.com" for i in range(50)] + ["admin.example.com/wp-login.php"]
+        run = self.runner()
+        path = Path(run.raw) / "subdomains" / "normalized.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(values) + "\n")
+        run.generate_reports(0)
+        text = (Path(run.work) / "result.txt").read_text()
+        block = text.split("[SUBDOMAINS]", 1)[1].split("[", 1)[0]
+        from_result = [l.strip() for l in block.splitlines() if ".example.com" in l]
+        self.assertEqual(from_result, rank_hunt(values)[:len(from_result)])
+
+
 if __name__ == "__main__":
+
     unittest.main(verbosity=2)
