@@ -810,6 +810,77 @@ def auth_fingerprint(headers:dict[str,str])->dict[str,Any]:
     return {"present":True,"credential_id":credential_fingerprint(headers),
             "header_kinds":kinds,"header_count":len(headers)}
 
+class CookieJar:
+    """
+    Live session state, kept per host, absorbing Set-Cookie from every response.
+
+    The session used to be read from --cookie-file once at startup and never touched again, so a run
+    that started authenticated degraded to anonymous partway through when the session rotated - and
+    nothing in any artifact recorded that it had happened. A report built from half-anonymous evidence
+    is indistinguishable from a fully authenticated one, which is the exact confusion an access-check
+    candidate depends on being able to rule out.
+
+    Values live here and in a 0600 file under the run directory, and nowhere else. Fingerprints,
+    names and expiry are what get reported.
+    """
+
+    def __init__(self)->None:
+        self.lock=threading.Lock()
+        self.by_host:dict[str,dict[str,str]]={}
+        self.rotations=0
+        self.last_set_cookie:list[str]=[]
+
+    def seed(self,host:str,headers:dict[str,str])->None:
+        cookie=next((v for k,v in headers.items() if k.lower()=="cookie"),None)
+        if not cookie: return
+        with self.lock: self.by_host[self._key(host)]=self._pairs(cookie)
+
+    @staticmethod
+    def _key(host:str)->str: return (host or "").lower()
+
+    @staticmethod
+    def _pairs(value:str)->dict[str,str]:
+        out:dict[str,str]={}
+        for part in value.split(";"):
+            name,_,val=part.strip().partition("=")
+            if name: out[name]=val
+        return out
+
+    def header_for(self,host:str)->str:
+        with self.lock: pairs=dict(self.by_host.get(self._key(host),{}))
+        return "; ".join(f"{k}={v}" for k,v in pairs.items())
+
+    def absorb(self,host:str,set_cookie_headers:Iterable[str])->None:
+        """Fold Set-Cookie into the jar. Names and count are recorded; values never leave memory."""
+        names:list[str]=[]
+        with self.lock:
+            pairs=self.by_host.setdefault(self._key(host),{})
+            for raw in set_cookie_headers:
+                name,_,rest=raw.partition("=")
+                name=name.strip()
+                if not name: continue
+                val=rest.split(";",1)[0].strip()
+                if name in pairs and pairs[name]!=val: self.rotations+=1
+                pairs[name]=val
+                names.append(name)
+            self.last_set_cookie=names
+
+    def names(self,host:str)->list[str]:
+        with self.lock: return sorted(self.by_host.get(self._key(host),{}))
+
+    def fingerprint(self,host:str)->str:
+        with self.lock: pairs=self.by_host.get(self._key(host),{})
+        if not pairs: return ""
+        return hashlib.sha256("|".join(f"{k}={v}" for k,v in sorted(pairs.items())).encode()).hexdigest()[:12]
+
+    def state(self)->dict[str,Any]:
+        """What may be reported: names, a hash, and how many times a value changed."""
+        with self.lock:
+            return {"cookie_names":{h:sorted(p) for h,p in self.by_host.items() if p},
+                    "cookie_fingerprints":{h:hashlib.sha256("|".join(f"{k}={v}" for k,v in sorted(p.items())).encode()).hexdigest()[:12]
+                                           for h,p in self.by_host.items() if p},
+                    "rotations":self.rotations}
+
 def host_of(v:str)->str:
     return (urlsplit(v if "://" in v else "//"+v).hostname or "").lower()
 
@@ -920,9 +991,11 @@ class Runner:
         # nothing, with no indication that the requested port was never touched.
         _u=urlsplit(self.seed); _default=443 if _u.scheme=="https" else 80
         self.probe_target=f"{self.host}:{_u.port}" if _u.port and _u.port!=_default else self.host; self.stop=threading.Event(); self.child:subprocess.Popen[str]|None=None
+        self.jar=CookieJar()
         self.identities={"anon":{},"a":{},"b":{}}
         if getattr(args,"cookie_file",None): self.identities["a"]=load_credentials(args.cookie_file)
         if getattr(args,"cookie_file_b",None): self.identities["b"]=load_credentials(args.cookie_file_b)
+        if self.identities["a"]: self.jar.seed(self.host,self.identities["a"])
         # Presence and shape only, never values. An artifact that hides the session also hides that
         # there was one, so a report built from an authenticated run reads exactly like one built
         # anonymously - which is precisely the confusion an access-check candidate creates.
@@ -1103,6 +1176,27 @@ class Runner:
         return limit_values(values,self.args.max_hosts)
     def read(self,sid:str)->list[str]:
         p=self.raw/sid/"normalized.txt"; return p.read_text().splitlines() if p.exists() else []
+    def persist_jar(self)->Path|None:
+        """
+        Write the live session to the run directory, 0600, so a resume does not start from the stale
+        original. A jar is credentials: the run directory already holds them at 0700, this file is
+        0600, and the values never appear in any report.
+        """
+        with self.jar.lock: hosts={h:dict(p) for h,p in self.jar.by_host.items() if p}
+        if not hosts: return None
+        self.work.mkdir(parents=True,exist_ok=True)
+        path=self.work/"sessions"/"cookies.txt"; path.parent.mkdir(parents=True,exist_ok=True)
+        body="\n".join("; ".join(f"{k}={v}" for k,v in sorted(pairs.items())) for pairs in hosts.values())+"\n"
+        path.write_text(body); os.chmod(path,0o600)
+        return path
+    def auth_summary(self)->str:
+        """One line for a human: which hosts hold a session, and whether it moved during the run."""
+        with self.jar.lock:
+            names=sorted(h for h,p in self.jar.by_host.items() if p); rotations=self.jar.rotations
+        if not names: return "no live session"
+        note=f"live session for {', '.join(names)}"
+        return note+(f"; rotated {rotations}x mid-run - evidence spans more than one session" if rotations else "; stable for the whole run")
+
     def preflight(self)->list[tuple[str,str,bool]]:
         """What this run is missing, before it spends anything discovering it.
 
@@ -1150,8 +1244,17 @@ class Runner:
         timeout=max(.1,min(self.args.request_timeout,deadline-time.monotonic()))
         conn=(http.client.HTTPSConnection if u.scheme=="https" else http.client.HTTPConnection)(u.hostname,u.port,timeout=timeout)
         try:
-            conn.request("GET",urlunsplit(("", "",u.path or "/",u.query,"")),headers={"User-Agent":"AutoRecon/8","Accept":"*/*"})
+            headers={"User-Agent":"AutoRecon/8","Accept":"*/*"}
+            cookie=self.jar.header_for(u.hostname)
+            if cookie: headers["Cookie"]=cookie
+            conn.request("GET",urlunsplit(("", "",u.path or "/",u.query,"")),headers=headers)
             resp=conn.getresponse(); body=resp.read(limit)
+            rotated=self.jar.absorb(u.hostname,_header_list(resp.headers,"set-cookie"))
+            if rotated and getattr(self.args,"cookie_file",None) and not self.args.dry_run:
+                print(f"[auth] session rotated mid-run: {len(rotated)} cookie(s) reissued "
+                      f"({', '.join(sorted(rotated))}); evidence after this point is the NEW session",
+                      flush=True)
+                self.persist_jar()
             # Headers are opt-in: most callers only need the body, and returning a 3-tuple
             # unconditionally would break every existing call site.
             return (resp.status,body,resp.headers) if with_headers else (resp.status,body)
@@ -1938,6 +2041,7 @@ class Runner:
             auth_line+=" -- two distinct identities"
         out=[sep,f"  AutoRecon v{__version__} -- {self.seed}",f"  Run    : {self.run_id}",
              f"  Auth   : {auth_line}",
+             f"  Session: {self.auth_summary()}",
              f"  Status : {status}",f"  Started: {self.started_at}",sep]
         out+=section("DNS RECORDS",[f"  {x}" for x in dns])
         out+=section("SUBDOMAINS",[f"  {x}" for x in subdomains])
@@ -2092,7 +2196,7 @@ class Runner:
     def generate_reports(self,rc:int)->None:
         self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=self.resume_command()
         hunt=self.hunt_queue()
-        report={"version":"8.0.0","auth_state":getattr(self,"auth_state",{}),"run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"hunt_queue":hunt,"vulnerability_claims":[],"stages":stages}
+        report={"version":"8.0.0","auth_state":getattr(self,"auth_state",{}),"session":self.jar.state(),"run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"hunt_queue":hunt,"vulnerability_claims":[],"stages":stages}
         atomic_json(self.work/"report.json",report)
         with (self.work/"stages.csv").open("w",newline="") as f:
             w=csv.writer(f); w.writerow(["stage","status","processed","total","runtime_seconds","exit_code","reason"]); w.writerows([[s["id"],s["status"],s["processed"],s["total"],s["runtime_seconds"],s["exit_code"],s["failure_reason"]] for s in stages])
