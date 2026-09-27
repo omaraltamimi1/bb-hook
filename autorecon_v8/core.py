@@ -37,6 +37,10 @@ PROFILES: dict[str,dict[str,Any]] = {
  "custom":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":600.0,"stage_timeout":1200.0,"max_hosts":500,"skip":[]},
 }
 
+UNUSUAL_PORTS = {21,22,23,25,110,143,445,1433,1521,2049,2375,3000,3306,3389,4369,5000,5432,5601,5672,5900,5984,6379,6443,8000,8008,8080,8081,8443,8888,9000,9042,9090,9200,9300,9418,9443,10000,11211,15672,27017,28017,50000}
+HUNT_LIMIT = 80
+HUNT_SENSITIVE = re.compile(r"(?:\.env|wp-config\.php|wp-login|/phpmyadmin|/admin(?:/|$)|/_cat/|/actuator|/\.git/|/\.git$|/\.aws/|/\.ssh/|/server-status|/\.DS_Store|/\.env\.local|/(?:openapi|swagger)\.json|/graphql|/graphiql|/__debug__|/debug/|/wp-json|/xmlrpc\.php|/config\.json|/\.well-known/security\.txt)",re.IGNORECASE)
+
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True); fd,tmp=tempfile.mkstemp(prefix=".state-",dir=path.parent)
@@ -249,14 +253,50 @@ class Runner:
             for i,o in enumerate(origins): self.check(deadline); futures.append(ex.submit(one,i,o))
             for f in futures: self.check(deadline); f.result(timeout=max(.1,deadline-time.monotonic()))
         out=self.raw/st.id/"metrics.jsonl"; out.write_text("".join(json.dumps(x)+"\n" for x in results)); st.outputs=[str(out)]
+    def hunt_queue(self,limit:int=HUNT_LIMIT)->list[dict[str,str]]:
+        items:list[dict[str,str]]=[]; seen:set[str]=set()
+        def add(value:str,why:str,stage:str)->None:
+            value=value.strip()
+            if not value or value in seen: return
+            if not self.scope.decide(value)[0]: return
+            seen.add(value); items.append({"value":value,"why":why,"stage":stage,"active":str(stage in ACTIVE)})
+        def ranked(values:Iterable[str])->list[str]:
+            host=lambda v:(urlsplit(v if "://" in v else "//"+v).hostname or "").lower()
+            return sorted({v.strip() for v in values if v and v.strip()},key=lambda v:(0 if HUNT_SENSITIVE.search(v) else 1,len(v),host(v),v))
+        metrics=self.raw/"api-discovery"/"metrics.jsonl"
+        if metrics.exists():
+            for line in metrics.read_text(errors="replace").splitlines():
+                try: rec=json.loads(line)
+                except json.JSONDecodeError: continue
+                if not isinstance(rec,dict) or rec.get("error"): continue
+                status=rec.get("status")
+                if not isinstance(status,int) or not 200<=status<400: continue
+                add(str(rec.get("url") or ""),f"sensitive-path:{rec.get('probe','probe')}:{status}","api-discovery")
+        for value in ranked(self.read("corpus")):
+            if HUNT_SENSITIVE.search(value): add(value,"sensitive-path","corpus")
+        for value in ranked(self.read("httpx")): add(value,"live-host","httpx")
+        for value in ranked(self.read("ports")):
+            parsed=urlsplit(value if "://" in value else "//"+value)
+            try: port=parsed.port
+            except ValueError: port=None
+            add(value,"unusual-port" if port in UNUSUAL_PORTS else "open-port","ports")
+        for value in ranked(self.read("javascript")): add(value,"javascript","javascript")
+        active=[i for i in items if i["active"]=="True"]
+        return (active or items)[:limit]
     def generate_reports(self,rc:int)->None:
         self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=f"autorecon {self.seed} --resume {self.run_id} --output-dir {self.out}"
-        report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"vulnerability_claims":[],"stages":stages}
+        hunt=self.hunt_queue(); report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"vulnerability_claims":[],"hunt_queue":hunt,"stages":stages}
         atomic_json(self.work/"report.json",report)
         with (self.work/"stages.csv").open("w",newline="") as f:
             w=csv.writer(f); w.writerow(["stage","status","processed","total","runtime_seconds","exit_code","reason"]); w.writerows([[s["id"],s["status"],s["processed"],s["total"],s["runtime_seconds"],s["exit_code"],s["failure_reason"]] for s in stages])
         lines=[f"# AutoRecon v8 — Raccoon 4K\n\nTarget: `{self.seed}`  \nRun: `{self.run_id}`  \nStatus: **{report['status']}**\n", "## Stage summary\n", "| Stage | Status | Progress | Runtime | Reason |\n|---|---|---:|---:|---|"]
         lines += [f"| {s['id']} | {s['status']} | {s['processed']}/{s['total']} | {s['runtime_seconds']}s | {s['failure_reason'] or ''} |" for s in stages]
+        lines += ["\n## Hunt queue\n"]
+        if hunt:
+            lines += ["| # | Why | Stage | Active | Value |","|---:|---|---|---|---|"]
+            lines += [f"| {i} | `{item['why']}` | {item['stage']} | {item['active']} | `{item['value']}` |" for i,item in enumerate(hunt,1)]
+        else:
+            lines.append("No ranked candidates yet.")
         lines += ["\n## Evidence\n",f"- Raw evidence: `{self.raw}`",f"- Commands: `{self.command_log}`",f"- Scope decisions: `{self.scope_log}`","\n## Vulnerability claims\n\nNo automated candidate is represented as a validated vulnerability.",f"\n## Resume\n\n`{resume}`\n"]
         (self.work/"report.md").write_text("\n".join(lines))
 
