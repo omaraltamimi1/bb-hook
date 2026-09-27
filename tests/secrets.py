@@ -164,5 +164,74 @@ class TestSecretsNeverReachArtifacts(unittest.TestCase):
         self.assertGreaterEqual(len(found), 8, f"the walk only reached {len(found)} files")
 
 
+class TestResumeCommandRoundTrips(unittest.TestCase):
+    """The resume line in report.json has to survive argparse, and has to carry the scope flags.
+
+    A resume that drops --scope-exclude widens the target, dropping --profile changes the tool mix,
+    and dropping --strict-scope removes the enforcement that was the point of the run. The operator
+    pastes the line and the artifacts then describe a run that was never authorised.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+
+    def build(self, *extra):
+        return Runner(apply_profile_defaults(parser().parse_args(
+            ["127.0.0.1", "--output-dir", self.tmp, "--dry-run", *extra])))
+
+    def round_trip(self, *extra):
+        from autorecon_v8.core import STAGE_IDS, StageState
+        run = self.build(*extra)
+        run.command = lambda *a, **k: 0
+        run.stages = {s: StageState(id=s, name=s, description="", dependencies=[]) for s in STAGE_IDS}
+        run.generate_reports(0)
+        line = json.loads((Path(run.work) / "report.json").read_text())["resume_command"]
+        return line, line.split()
+
+    def test_the_resume_line_parses(self):
+        line, argv = self.round_trip("--rate-limit", "3.5")
+        self.assertEqual(argv[0], "autorecon")
+        self.assertIn("--resume", argv)
+        self.assertIn("--rate-limit", argv)
+        parser().parse_args(argv[1:])
+
+    def test_scope_exclude_survives(self):
+        line, argv = self.round_trip("--scope-exclude", "third-party.example.com")
+        self.assertIn("third-party.example.com", line,
+                      "the resume line drops --scope-exclude, which widens the target")
+        args = parser().parse_args(argv[1:])
+        self.assertIn("third-party.example.com", args.scope_exclude)
+
+    def test_scope_include_survives(self):
+        line, _ = self.round_trip("--scope-include", "only.example.com")
+        self.assertIn("only.example.com", line)
+
+    def test_strict_scope_survives(self):
+        line, argv = self.round_trip("--strict-scope")
+        self.assertIn("--strict-scope", line,
+                      "the resume line drops --strict-scope, removing the enforcement")
+        self.assertTrue(parser().parse_args(argv[1:]).strict_scope)
+
+    def test_every_artifact_carries_the_same_resume_line(self):
+        from autorecon_v8.core import STAGE_IDS, StageState
+        run = self.build("--scope-exclude", "x.example.com")
+        run.command = lambda *a, **k: 0
+        run.stages = {s: StageState(id=s, name=s, description="", dependencies=[]) for s in STAGE_IDS}
+        run.generate_reports(0)
+        expected = json.loads((Path(run.work) / "report.json").read_text())["resume_command"]
+        self.assertIn(expected, (Path(run.work) / "report.md").read_text())
+        self.assertIn(expected, (Path(run.work) / "result.txt").read_text())
+
+    def test_the_resume_line_never_carries_a_credential(self):
+        jar = Path(self.tmp) / "c.txt"
+        jar.write_text(f"Cookie: sessionid={SECRET}\n")
+        line, _ = self.round_trip("--cookie-file", str(jar))
+        self.assertNotIn(SECRET, line, "the resume line inlined a live session")
+        self.assertIn(str(jar), line, "the credential is referenced by path instead")
+
+
 if __name__ == "__main__":
+
     unittest.main(verbosity=2)
