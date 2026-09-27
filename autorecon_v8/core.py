@@ -23,12 +23,12 @@ from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 STATUSES = {"pending", "running", "completed", "partial", "failed", "skipped", "interrupted"}
-STAGE_IDS = ["dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports", "crawl", "archives", "corpus", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks", "report"]
+STAGE_IDS = ["dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports", "crawl", "archives", "corpus", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks", "takeover", "report"]
 ACTIVE = {"screenshots", "ports", "crawl", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks"}
 DESCRIPTIONS = {
- "dns":"Collect DNS records", "subdomains":"Enumerate passive subdomains", "dnsx":"Resolve discovered names", "tls":"Collect TLS metadata", "httpx":"Identify HTTP origins", "screenshots":"Capture visual evidence", "ports":"Discover ports", "crawl":"Crawl live applications", "archives":"Collect archived URLs", "corpus":"Normalize and deduplicate URLs", "javascript":"Preserve and inspect JavaScript", "api-discovery":"Read-only API and identity probes", "web-intelligence":"Collect web metadata", "arjun":"Discover parameters", "nmap":"Validate exposed services", "ffuf":"Discover content", "access-checks":"Read-only access differentials", "report":"Publish reports"}
+ "dns":"Collect DNS records", "subdomains":"Enumerate passive subdomains", "dnsx":"Resolve discovered names", "tls":"Collect TLS metadata", "httpx":"Identify HTTP origins", "screenshots":"Capture visual evidence", "ports":"Discover ports", "crawl":"Crawl live applications", "archives":"Collect archived URLs", "corpus":"Normalize and deduplicate URLs", "javascript":"Preserve and inspect JavaScript", "api-discovery":"Read-only API and identity probes", "web-intelligence":"Collect web metadata", "arjun":"Discover parameters", "nmap":"Validate exposed services", "ffuf":"Discover content", "access-checks":"Read-only access differentials", "takeover":"Detect dangling CNAME takeover candidates", "report":"Publish reports"}
 DEPS = {s: ([STAGE_IDS[i-1]] if i else []) for i,s in enumerate(STAGE_IDS)}
-DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"nmap":["ports"],"ffuf":["httpx"],"access-checks":["corpus"],"report":[]})
+DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"nmap":["ports"],"ffuf":["httpx"],"access-checks":["corpus"],"takeover":["dnsx"],"report":[]})
 PROFILES: dict[str,dict[str,Any]] = {
  "passive":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":500,"skip":sorted(ACTIVE)},
  "fast":{"concurrency":8,"rate_limit":20.0,"request_timeout":8.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":200,"skip":["screenshots","nmap","ffuf"]},
@@ -36,6 +36,41 @@ PROFILES: dict[str,dict[str,Any]] = {
  "deep":{"concurrency":20,"rate_limit":10.0,"request_timeout":20.0,"tool_timeout":1800.0,"stage_timeout":7200.0,"max_hosts":5000,"skip":[]},
  "custom":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":600.0,"stage_timeout":1200.0,"max_hosts":500,"skip":[]},
 }
+
+# CNAME suffix -> (provider, banner signatures). The signatures are the provider's own
+# error text and are only consulted when --takeover-verify is passed, because confirming a
+# takeover means requesting a third-party SaaS host that the target's program does not cover.
+TAKEOVER_PROVIDERS = {
+    "herokuapp.com": ("Heroku", ("No such app",)),
+    "herokudns.com": ("Heroku DNS", ("No such app",)),
+    "cloudfront.net": ("AWS CloudFront", ("The specified bucket does not exist", "DistributionNotFound")),
+    "s3.amazonaws.com": ("AWS S3", ("NoSuchBucket", "The specified bucket does not exist")),
+    "elasticbeanstalk.com": ("AWS Elastic Beanstalk", ("Environment not found",)),
+    "azurewebsites.net": ("Azure App Service", ("404",)),
+    "cloudapp.net": ("Azure Cloud App", ("404",)),
+    "cloudapp.azure.com": ("Azure Cloud App", ("404",)),
+    "azureedge.net": ("Azure CDN", ("404",)),
+    "trafficmanager.net": ("Azure Traffic Manager", ("404",)),
+    "firebaseapp.com": ("Firebase Hosting", ("404", "Site Not Found")),
+    "web.app": ("Firebase Hosting", ("404", "Site Not Found")),
+    "netlify.app": ("Netlify", ("Not Found",)),
+    "netlify.com": ("Netlify", ("Not Found",)),
+    "vercel.app": ("Vercel", ("404",)),
+    "vercel.com": ("Vercel", ("404",)),
+    "pages.dev": ("Cloudflare Pages", ("404",)),
+    "pages.github.com": ("GitHub Pages", ("404",)),
+    "github.io": ("GitHub Pages", ("404",)),
+    "surge.sh": ("Surge", ("project not found",)),
+    "glitch.me": ("Glitch", ("<!doctype html><title>404",)),
+    "repl.co": ("Replit", ("404",)),
+    "onrender.com": ("Render", ("Not Found",)),
+    "readthedocs.io": ("Read the Docs", ("unknown to Read the Docs",)),
+    "myshopify.com": ("Shopify", ("Sorry, this shop is currently unavailable",)),
+    "ghost.io": ("Ghost", ("404",)),
+    "bigcartel.com": ("BigCartel", ("404",)),
+    "tumblr.com": ("Tumblr", ("There's nothing here",)),
+}
+TAKEOVER_DEFAULT_LIMIT = 40
 
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
@@ -142,13 +177,13 @@ class Runner:
         except (ProcessLookupError,subprocess.TimeoutExpired):
             try: os.killpg(p.pid,signal.SIGKILL)
             except ProcessLookupError: pass
-    def command(self,stage:str,cmd:list[str],target:str,deadline:float,output:Path)->int:
+    def command(self,stage:str,cmd:list[str],target:str,deadline:float,output:Path,cwd:Path|None=None)->int:
         rec={"timestamp":now(),"stage":stage,"command":cmd,"target":target,"dry_run":self.args.dry_run}
         with self.command_log.open("a") as f:f.write(json.dumps(rec)+"\n")
         if self.args.dry_run: print("[dry-run]",subprocess.list2cmdline(cmd)); return 0
         err=self.raw/stage/(output.name+".stderr"); err.parent.mkdir(parents=True,exist_ok=True); output.parent.mkdir(parents=True,exist_ok=True)
         with output.open("a") as out,err.open("a") as ef:
-            p=subprocess.Popen(cmd,stdout=out,stderr=ef,text=True,start_new_session=True); self.child=p; start=time.monotonic(); next_beat=start
+            p=subprocess.Popen(cmd,stdout=out,stderr=ef,text=True,start_new_session=True,cwd=str(cwd) if cwd else None); self.child=p; start=time.monotonic(); next_beat=start
             try:
                 while p.poll() is None:
                     self.check(min(deadline,start+self.args.tool_timeout))
@@ -189,6 +224,7 @@ class Runner:
         try:
             if st.id=="report": self.generate_reports(0)
             elif st.id=="api-discovery": self.api_stage(st,deadline)
+            elif st.id=="takeover": self.takeover_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -223,6 +259,73 @@ class Runner:
         else:
             # Complex active integrations retain a deterministic candidate list for explicit operator/tool follow-up.
             for i,v in enumerate(values,1): self.check(deadline); self.log_scope(v); self.write_lines(dest,[v]); st.processed=i; print(f"[{st.id}] {i}/{st.total} {v} | elapsed={fmt(time.monotonic()-(deadline-self.args.stage_timeout))}",flush=True)
+    @staticmethod
+    def takeover_provider(target:str)->tuple[str,tuple[str,...]]|None:
+        host=(target or "").strip().rstrip(".").lower()
+        best=None
+        for suffix,entry in TAKEOVER_PROVIDERS.items():
+            if host==suffix or host.endswith("."+suffix):
+                if best is None or len(suffix)>len(best[0]): best=(suffix,entry)
+        return (best[1][0],best[1][1]) if best else None
+    @staticmethod
+    def takeover_banner(body:str,signatures:tuple[str,...])->str|None:
+        text=(body or "")[:4096]
+        for sig in signatures:
+            if sig and sig.lower() in text.lower(): return sig
+        return None
+    def takeover_stage(self,st:StageState,deadline:float)->None:
+        values=[v for v in self.inputs(st.id) if v]; dest=self.raw/st.id/"normalized.txt"; st.total=len(values); st.inputs=values; st.outputs=[str(dest)]
+        if not values: st.status="skipped"; st.failure_reason="no resolved names from dnsx"; return
+        if self.args.dry_run: self.write_lines(dest,values); st.processed=st.total; return
+        tool=shutil.which("dnsx")
+        if not tool: st.status="skipped"; st.failure_reason="missing external tool: dnsx"; return
+        root=self.raw/st.id; root.mkdir(parents=True,exist_ok=True)
+        input_file=root/"inputs.txt"; self.write_lines(input_file,values)
+        stdout=root/"stdout.txt"
+        rc=self.command(st.id,[tool,"-silent","-l",str(input_file),"-cname","-json","-no-color"],self.host,deadline,stdout,cwd=root); st.exit_code=rc
+        verify=bool(getattr(self.args,"takeover_verify",False)); limit=int(getattr(self.args,"takeover_limit",0) or TAKEOVER_DEFAULT_LIMIT)
+        rows:list[str]=[]; checked=0
+        for line in stdout.read_text(errors="replace").splitlines() if stdout.exists() else []:
+            self.check(deadline)
+            line=line.strip()
+            if not line.startswith("{"): continue
+            try: rec=json.loads(line)
+            except json.JSONDecodeError: continue
+            if not isinstance(rec,dict): continue
+            host=str(rec.get("host") or "").strip().rstrip(".").lower()
+            targets=rec.get("cname") or []
+            if isinstance(targets,str): targets=[targets]
+            addresses=rec.get("a") or rec.get("aaaa") or []
+            if isinstance(addresses,str): addresses=[addresses]
+            if not host or not targets: continue
+            if not self.scope.decide(host)[0]: continue
+            for target in targets:
+                checked+=1
+                match=self.takeover_provider(str(target))
+                if not match: continue
+                if addresses: continue
+                provider,signatures=match; evidence="dns: dangling CNAME, no address record"
+                if verify:
+                    body=self._takeover_fetch(str(target),deadline)
+                    sig=self.takeover_banner(body,signatures) if body is not None else None
+                    if sig: evidence=f"http: banner matched {sig!r}"
+                    else: evidence+="; http banner did not match, unconfirmed"
+                rows.append("\t".join([host,provider,str(target),evidence]))
+        deduped=list(dict.fromkeys(rows))
+        if limit>0: deduped=deduped[:limit]
+        self.write_lines(dest,deduped); st.outputs=[str(dest)]
+        st.processed=len(values)
+        print(f"[takeover] {len(deduped)} candidate(s) from {checked} CNAME(s) across {len(values)} name(s)",flush=True)
+        if rc and not deduped: st.status="partial"; st.failure_reason=f"dnsx exited {rc} and produced no usable CNAME data"
+    def _takeover_fetch(self,target:str,deadline:float)->str|None:
+        u=urlsplit(target if "://" in target else "https://"+target)
+        if not u.hostname: return None
+        conn=(http.client.HTTPSConnection if u.scheme=="https" else http.client.HTTPConnection)(u.hostname,u.port,timeout=min(self.args.request_timeout,max(.1,deadline-time.monotonic())))
+        try:
+            conn.request("GET",urlunsplit(("", "",u.path or "/",u.query,"")),headers={"User-Agent":"AutoRecon/8"})
+            return conn.getresponse().read(8192).decode("utf-8","ignore")
+        except (OSError,http.client.HTTPException): return None
+        finally: conn.close()
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
@@ -251,12 +354,18 @@ class Runner:
         out=self.raw/st.id/"metrics.jsonl"; out.write_text("".join(json.dumps(x)+"\n" for x in results)); st.outputs=[str(out)]
     def generate_reports(self,rc:int)->None:
         self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=f"autorecon {self.seed} --resume {self.run_id} --output-dir {self.out}"
-        report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"vulnerability_claims":[],"stages":stages}
+        takeover=self.read("takeover"); report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"vulnerability_claims":[],"takeover_candidates":[dict(zip(("host","provider","target","evidence"),line.split("\t",3))) for line in takeover if line.count("\t")>=3],"stages":stages}
         atomic_json(self.work/"report.json",report)
         with (self.work/"stages.csv").open("w",newline="") as f:
             w=csv.writer(f); w.writerow(["stage","status","processed","total","runtime_seconds","exit_code","reason"]); w.writerows([[s["id"],s["status"],s["processed"],s["total"],s["runtime_seconds"],s["exit_code"],s["failure_reason"]] for s in stages])
         lines=[f"# AutoRecon v8 — Raccoon 4K\n\nTarget: `{self.seed}`  \nRun: `{self.run_id}`  \nStatus: **{report['status']}**\n", "## Stage summary\n", "| Stage | Status | Progress | Runtime | Reason |\n|---|---|---:|---:|---|"]
         lines += [f"| {s['id']} | {s['status']} | {s['processed']}/{s['total']} | {s['runtime_seconds']}s | {s['failure_reason'] or ''} |" for s in stages]
+        lines += ["\n## Takeover candidates\n"]
+        if takeover:
+            lines += ["| Host | Provider | Target | Evidence |","|---|---|---|---|"]
+            lines += ["".join("| "+c+" |" for c in line.split("\t",3)) for line in takeover]
+        else:
+            lines.append("No dangling CNAME candidates.")
         lines += ["\n## Evidence\n",f"- Raw evidence: `{self.raw}`",f"- Commands: `{self.command_log}`",f"- Scope decisions: `{self.scope_log}`","\n## Vulnerability claims\n\nNo automated candidate is represented as a validated vulnerability.",f"\n## Resume\n\n`{resume}`\n"]
         (self.work/"report.md").write_text("\n".join(lines))
 
