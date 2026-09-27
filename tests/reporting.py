@@ -5,7 +5,9 @@ result.txt that lists every URL is the same as one that lists none, and one that
 candidate as a confirmed vulnerability is worse than no file at all.
 """
 
+import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -390,6 +392,76 @@ class TestResultTxtIsCappedAndRanked(unittest.TestCase):
         self.assertEqual(from_result, rank_hunt(values)[:len(from_result)])
 
 
+class TestOneVersionNumber(unittest.TestCase):
+    """Four different version numbers in one package means nobody can say which build produced a
+    report. Every writer reads __version__; a hardcoded literal anywhere is a bug, and the check is
+    textual so a new writer cannot quietly reintroduce one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+
+    def test_report_json_carries_the_package_version(self):
+        from autorecon_v8 import __version__
+        run = build(self.tmp)
+        run.generate_reports(0)
+        data = json.loads((Path(run.work) / "report.json").read_text())
+        self.assertEqual(data["version"], __version__,
+                         "report.json's version does not match the package")
+
+    def test_report_md_carries_the_package_version(self):
+        from autorecon_v8 import __version__
+        run = build(self.tmp)
+        run.generate_reports(0)
+        text = (Path(run.work) / "report.md").read_text()
+        self.assertIn(f"AutoRecon v{__version__}", text,
+                      "report.md's heading does not match the package version")
+
+    def test_result_txt_carries_the_package_version(self):
+        from autorecon_v8 import __version__
+        run = build(self.tmp)
+        run.generate_reports(0)
+        self.assertIn(f"AutoRecon v{__version__}",
+                      (Path(run.work) / "result.txt").read_text())
+
+    def test_no_source_file_hardcodes_a_version(self):
+        import autorecon_v8
+        root = Path(autorecon_v8.__file__).parent
+        offenders = []
+        for source in root.glob("*.py"):
+            for number, line in enumerate(source.read_text().splitlines(), 1):
+                if '__version__' in line or line.lstrip().startswith("#"):
+                    continue
+                if re.search(r'(?<!\d)8\.\d+\.\d+(?!\d)', line) and "version" in line.lower():
+                    offenders.append(f"{source.name}:{number}: {line.strip()[:80]}")
+        self.assertEqual(offenders, [],
+                         f"a hardcoded version crept back in: {offenders}")
+
+    def test_the_cli_banner_carries_the_package_version(self):
+        """--help is where an operator checks which build they are running."""
+        import contextlib
+        import io
+        from autorecon_v8 import __version__
+        from autorecon_v8.cli import parser
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit):
+                parser().parse_args(["--help"])
+        self.assertIn(f"AutoRecon v{__version__}", buf.getvalue(),
+                      "the CLI banner does not match the package version")
+
+    def test_pyproject_reads_the_same_number(self):
+        import autorecon_v8
+        from autorecon_v8 import __version__
+        text = (Path(autorecon_v8.__file__).parent.parent / "pyproject.toml").read_text()
+        found = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+        self.assertIsNotNone(found, "pyproject.toml has no static version to compare")
+        self.assertEqual(found.group(1), __version__,
+                         "pyproject.toml and the package disagree on the version")
+
+
 if __name__ == "__main__":
+
 
     unittest.main(verbosity=2)
