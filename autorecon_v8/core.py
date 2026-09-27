@@ -28,12 +28,12 @@ ACTIVE = {"screenshots", "ports", "crawl", "javascript", "api-discovery", "web-i
 DESCRIPTIONS = {
  "dns":"Collect DNS records", "subdomains":"Enumerate passive subdomains", "dnsx":"Resolve discovered names", "tls":"Collect TLS metadata", "httpx":"Identify HTTP origins", "screenshots":"Capture visual evidence", "ports":"Discover ports", "crawl":"Crawl live applications", "archives":"Collect archived URLs", "corpus":"Normalize and deduplicate URLs", "javascript":"Preserve and inspect JavaScript", "api-discovery":"Read-only API and identity probes", "web-intelligence":"Collect web metadata", "arjun":"Discover parameters", "nmap":"Validate exposed services", "ffuf":"Discover content", "access-checks":"Read-only access differentials", "report":"Publish reports"}
 DEPS = {s: ([STAGE_IDS[i-1]] if i else []) for i,s in enumerate(STAGE_IDS)}
-DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"nmap":["ports"],"ffuf":["httpx"],"access-checks":["corpus"],"report":[]})
+DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"nmap":["ports"],"ffuf":["corpus"],"access-checks":["corpus"],"report":[]})
 # Stages with a real implementation: a cmds entry in generic_stage, a method dispatched from
 # execute(), or report generation. Every other stage is routed out of the generic fallback and
 # reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
 # added stage cannot escape classification.
-STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "arjun", "access-checks", "report"}
+STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "arjun", "ffuf", "access-checks", "report"}
 UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
 assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
 
@@ -301,6 +301,56 @@ def access_signals(states: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
 
 ARJUN_DEFAULT_MAX = 15
 
+FFUF_DEFAULT_MAX_HOSTS = 5
+FFUF_DEFAULT_MAX_TIME = 120
+FFUF_MAX_RECURSION_DEPTH = 3
+FFUF_WORDLIST_CANDIDATES = (
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+    "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-small.txt",
+    "config/sensitive-paths.txt",
+)
+
+
+def ffuf_wordlist(preferred: str | None = None) -> str | None:
+    """First wordlist that actually exists, so ffuf is never handed a missing path."""
+    if preferred:
+        return preferred if Path(preferred).is_file() else None
+    for candidate in FFUF_WORDLIST_CANDIDATES:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def ffuf_results(payload: str) -> list[dict[str, Any]]:
+    """
+    Parse ffuf's -of json into result records.
+
+    ffuf writes {"results": [...]} on success and an empty object when nothing matched, and
+    it can emit a bare array depending on build. All three are accepted; anything else is
+    treated as no results rather than guessed at.
+    """
+    try:
+        data = json.loads(payload or "{}")
+    except (ValueError, TypeError):
+        return []
+    rows: Any = data
+    if isinstance(data, dict):
+        rows = data.get("results")
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = row.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        out.append({"url": url, "status": row.get("status"), "length": row.get("length"),
+                    "words": row.get("words"), "lines": row.get("lines"),
+                    "content_type": row.get("content-type") or row.get("content_type"),
+                    "redirect": row.get("redirectlocation") or row.get("redirect")})
+    return out
+
 
 def arjun_parse(payload: str) -> list[tuple[str, list[str], str]]:
     """
@@ -527,6 +577,7 @@ class Runner:
             elif st.id=="crawl": self.crawl_stage(st,deadline)
             elif st.id=="access-checks": self.access_checks_stage(st,deadline)
             elif st.id=="arjun": self.arjun_stage(st,deadline)
+            elif st.id=="ffuf": self.ffuf_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -745,7 +796,7 @@ class Runner:
         except (OSError,http.client.HTTPException) as e:
             return {"status":0,"length":0,"sha256":"","json_keys":[],"stack_trace":False,"location":"","error":f"{type(e).__name__}: {e}"}
         finally: conn.close()
-    ACCESS_CHECK_INPUTS=(("corpus","params.txt"),("corpus","api.txt"),("arjun","params.txt"))
+    ACCESS_CHECK_INPUTS=(("corpus","params.txt"),("corpus","api.txt"),("arjun","params.txt"),("ffuf","paths.txt"))
     def access_check_targets(self)->tuple[list[str],list[str]]:
         """Targets from every partition this stage cares about, with provenance.
 
@@ -823,6 +874,75 @@ class Runner:
         print(f"[access-checks] {st.processed}/{len(targets)} target(s) probed across {len(states_available)} state(s): {len(real)} candidate(s), {len(suppressed)} suppressed, {len(set(refused))} refused out-of-scope",flush=True)
         if refused: st.failure_reason=f"{len(set(refused))} out-of-scope target(s) or callback(s) refused"
         if not real: st.status="completed"
+    def ffuf_stage(self,st:StageState,deadline:float)->None:
+        origins=[u for u in self.read_partition("origins.txt") if u.lower().startswith(("http://","https://"))]
+        seen=set(); hosts=[u for u in origins if not (u in seen or seen.add(u))]
+        root=self.raw/st.id; dest=root/"normalized.txt"; paths_out=root/"paths.txt"
+        cap=int(getattr(self.args,"ffuf_max_hosts",0) or FFUF_DEFAULT_MAX_HOSTS)
+        hosts=hosts[:cap]; st.total=len(hosts); st.inputs=hosts
+        if not hosts:
+            st.status="skipped"; st.failure_reason="no in-scope HTTP origins from corpus"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); self.write_lines(paths_out,[]); return
+        tool=shutil.which("ffuf")
+        if not tool:
+            st.status="skipped"; st.failure_reason="missing external tool: ffuf"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); self.write_lines(paths_out,[]); return
+        wordlist=ffuf_wordlist(getattr(self.args,"ffuf_wordlist",None))
+        if not wordlist:
+            st.status="skipped"; st.failure_reason="no ffuf wordlist found; set --ffuf-wordlist"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); self.write_lines(paths_out,[]); return
+        if self.args.dry_run:
+            self.write_lines(dest,hosts); st.processed=st.total; st.outputs=[str(dest)]; return
+        root.mkdir(parents=True,exist_ok=True)
+        # Bound every axis ffuf exposes. Its own defaults are unsafe for an unattended run:
+        # 40 threads, no overall time limit, and a match list that includes 403 and 500.
+        threads=max(1,min(int(getattr(self.args,"ffuf_threads",0) or 0) or self.args.concurrency,40))
+        per_host=max(5,min(int(getattr(self.args,"ffuf_max_time",0) or FFUF_DEFAULT_MAX_TIME),FFUF_DEFAULT_MAX_TIME))
+        delay=max(0.0,float(getattr(self.args,"ffuf_delay",0) or 0))
+        recurse=bool(getattr(self.args,"ffuf_recursion",False))
+        depth=max(1,min(int(getattr(self.args,"ffuf_recursion_depth",0) or 1),FFUF_MAX_RECURSION_DEPTH)) if recurse else 0
+        identity=self.identities.get("a") or {}
+        discovered:list[str]=[]; records:list[dict[str,Any]]=[]
+        for origin in hosts:
+            self.check(deadline)
+            if time.monotonic()>=deadline:
+                st.status="partial"; st.failure_reason="stage deadline reached before all origins were fuzzed"; break
+            out_file=root/(re.sub(r"[^A-Za-z0-9]+","_",origin)+".json")
+            cmd=[tool,"-u",origin.rstrip("/")+"/FUZZ","-w",wordlist,"-o",str(out_file),"-of","json",
+                 "-noninteractive","-s","-ac","-mc","all","-fc","404",
+                 "-t",str(threads),"-timeout",str(max(1,int(self.args.request_timeout))),
+                 "-maxtime",str(per_host)]
+            if delay: cmd+=["-p",str(delay)]
+            if recurse:
+                # ffuf requires -u to end in the FUZZ keyword for recursion to apply.
+                cmd+=["-recursion","-recursion-depth",str(depth),"-recursion-strategy","default"]
+            for k,v in identity.items(): cmd+=["-H",f"{k}: {v}"]
+            rc=self.command(st.id,cmd,self.host,deadline,root/"stdout.txt",cwd=root); st.exit_code=rc
+            payload=out_file.read_text(errors="replace") if out_file.exists() else ""
+            rows=ffuf_results(payload)
+            st.processed+=1
+            if not rows and rc not in (0,1):
+                print(f"[ffuf] {origin}: no parseable results (exit {rc})",flush=True)
+            for row in rows:
+                url=row["url"]
+                if not self.scope.decide(url)[0]:
+                    self.write_lines(root/"refused.txt",[f"{origin}\t{url}"]); continue
+                discovered.append(url)
+                records.append({**row,"origin":origin,"in_scope":True})
+        unique=sorted(dict.fromkeys(discovered))
+        self.write_lines(dest,[f"{r['origin']}\t{r['status']}\t{r['length']}\t{r['url']}" for r in records])
+        self.write_lines(paths_out,unique)
+        atomic_json(root/"findings.json",{"generated_at":now(),"run_id":self.run_id,"wordlist":wordlist,
+            "origins_fuzzed":st.processed,"origins_skipped":max(0,st.total-st.processed),
+            "threads":threads,"per_host_max_time":per_host,"recursion":recurse,"recursion_depth":depth,
+            "match_codes":"all","filter_codes":"404","autocalibrated":True,"identity":sorted(identity) or ["anonymous"],
+            "results":records,
+            "disclaimer":"paths ffuf matched are discovery candidates, not vulnerabilities. A 200 on a hidden path is not authorization bypass; correlate with access-checks and confirm the path is not intended to be public."})
+        st.outputs=[str(dest),str(paths_out),str(root/"findings.json")]
+        print(f"[ffuf] {st.processed}/{st.total} origin(s), {len(unique)} unique path(s), {len(records)} match(es), t={threads} maxtime={per_host}s/host recursion={depth}",flush=True)
+        if not unique and st.status=="pending" and not st.failure_reason:
+            st.failure_reason="ffuf matched no path on any origin"
+
     def arjun_stage(self,st:StageState,deadline:float)->None:
         pool=[v for v in self.read("corpus") if v.lower().startswith(("http://","https://"))]
         seen=set(); targets=[v for v in pool if not (v in seen or seen.add(v))]
