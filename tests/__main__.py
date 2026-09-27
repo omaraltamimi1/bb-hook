@@ -80,6 +80,7 @@ def load_tests(loader,tests,pattern):
  import tests.profiles as profiles
  import tests.resume_identity as resume_identity
  import tests.secrets as secrets
+ import tests.session_rotation as session_rotation
  tests.addTests(loader.loadTestsFromModule(stage_coverage))
  tests.addTests(loader.loadTestsFromModule(access_matrix))
  tests.addTests(loader.loadTestsFromModule(web_intelligence))
@@ -93,6 +94,7 @@ def load_tests(loader,tests,pattern):
  tests.addTests(loader.loadTestsFromModule(profiles))
  tests.addTests(loader.loadTestsFromModule(resume_identity))
  tests.addTests(loader.loadTestsFromModule(secrets))
+ tests.addTests(loader.loadTestsFromModule(session_rotation))
  return tests
 
 if __name__=='__main__':unittest.main(verbosity=2)
