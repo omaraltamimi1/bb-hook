@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from . import __version__
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -202,6 +203,13 @@ def future_timeout(deadline:float,ceiling:float)->float:
 
 WEB_INTEL_DEFAULT_MAX = 40
 WEB_INTEL_BODY_LIMIT = 1_000_000
+KALI_SHARE_RESULTS = "/mnt/KaliShare/autorecon-results"
+# Paths worth a human glance in a result file. Deliberately narrow: a result.txt that lists
+# everything is the same as one that lists nothing.
+HIGH_VALUE_URL_RE = re.compile(
+    r"(\.git/HEAD|\.env|wp-config\.php|/admin/?|/phpmyadmin|/_cat/|/actuator|/__debug__"
+    r"|/graphql|/graphiql|/openapi|/swagger|/api/|/v\d+/|/internal|/private|/backup)",
+    re.IGNORECASE)
 SECURITY_HEADERS = ("content-security-policy", "strict-transport-security", "x-frame-options",
                     "x-content-type-options", "referrer-policy", "permissions-policy",
                     "access-control-allow-origin", "access-control-allow-credentials")
@@ -650,6 +658,26 @@ def atomic_json(path: Path, data: Any) -> None:
         os.replace(tmp,path)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
+
+def atomic_text(path: Path, content: str) -> None:
+    """Write text atomically.
+
+    atomic_json is json-specific, and a half-written result.txt is worse than none: it is the file
+    a human reads to decide what to chase, so a truncated write that looks complete is the one
+    failure mode worth spending a temp file on.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".result-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
 
 def normalize_target(raw: str) -> tuple[str,str]:
     if not raw or any(c in raw for c in "\r\n\0"): raise ValueError("target is empty or contains control characters")
@@ -1456,6 +1484,82 @@ class Runner:
             for i,o in enumerate(origins): self.check(deadline); futures.append(ex.submit(one,i,o))
             for f in futures: self.check(deadline); f.result(timeout=future_timeout(deadline,self.args.tool_timeout))
         out=self.raw/st.id/"metrics.jsonl"; out.write_text("".join(json.dumps(x)+"\n" for x in results)); st.outputs=[str(out)]
+    def write_result_txt(self,status:str,resume:str,stages:list[dict[str,Any]])->Path|None:
+        """
+        One clean human-readable result.txt: the file a human reads to decide what to chase.
+
+        Written to the run directory always, and mirrored to the shared evidence mount
+        best-effort. Only non-empty sections appear, so an empty section never implies a finding
+        that was not there. Everything in it is a candidate, never a validated vulnerability.
+        """
+        sep="="*72; sep2="-"*72
+        def section(title:str,lines:list[str])->list[str]:
+            return ["",f"[{title}]"]+lines if lines else []
+        def read_stage(sid:str)->list[str]:
+            return [l.strip() for l in self.read(sid) if l.strip() and not l.strip().startswith(";")]
+
+        dns=read_stage("dns")
+        subdomains=sorted(set(read_stage("subdomains")+read_stage("dnsx")))
+        live=read_stage("httpx")
+        ports=read_stage("ports")
+        interesting=[u for u in self.read("corpus") if HIGH_VALUE_URL_RE.search(u)]
+
+        # The money sections. These are candidates produced by the stages added after the
+        # original result.txt design, and they are what a bounty run is actually read for.
+        ac=self.raw/"access-checks"
+        candidates:list[str]=[]
+        if (ac/"anomalies.tsv").exists():
+            for line in (ac/"anomalies.tsv").read_text(errors="replace").splitlines()[1:]:
+                c=line.split("\t")
+                if len(c)>=5 and c[1]:
+                    candidates.append(f"  [{c[2]}/{c[3]}] {c[1]}\n      {c[0]}\n      {c[5] if len(c)>5 else ''}".rstrip())
+        suppressed_count=0
+        if (ac/"suppressed.tsv").exists():
+            suppressed_count=max(0,len([l for l in (ac/"suppressed.tsv").read_text(errors="replace").splitlines()[1:] if l.strip()]))
+        paths=read_stage("ffuf")
+        endpoints=read_stage("web-intelligence")
+
+        stage_rows=[]
+        for row in stages:
+            if row["status"]=="pending": continue
+            runtime=fmt(row["runtime_seconds"]) if row["runtime_seconds"] else "-"
+            items=str(row["processed"]) if row["processed"] else "-"
+            reason=f"  ({row['failure_reason']})" if row["failure_reason"] else ""
+            stage_rows.append(f"  {row['id']:<20} {row['status']:<14} {items:>6} items   {runtime}{reason}")
+
+        out=[sep,f"  AutoRecon v{__version__} -- {self.seed}",f"  Run    : {self.run_id}",
+             f"  Status : {status}",f"  Started: {self.started_at}",sep]
+        out+=section("DNS RECORDS",[f"  {x}" for x in dns])
+        out+=section("SUBDOMAINS",[f"  {x}" for x in subdomains])
+        out+=section("LIVE HOSTS",[f"  {x}" for x in live])
+        out+=section("OPEN PORTS",[f"  {x}" for x in ports])
+        out+=section("INTERESTING URLS",[f"  {x}" for x in interesting])
+        out+=section("ACCESS-CHECK CANDIDATES (not validated vulnerabilities)",candidates)
+        if suppressed_count:
+            out+=["",f"[SUPPRESSED AS CORRECT BEHAVIOUR]  {suppressed_count} route(s) - see access-checks/suppressed.tsv"]
+        out+=section("DISCOVERED PATHS (ffuf candidates)",[f"  {x}" for x in paths])
+        out+=section("DISCOVERED ENDPOINTS (web-intelligence candidates)",[f"  {x}" for x in endpoints])
+        if stage_rows: out+=["","[STAGE SUMMARY]"]+stage_rows
+        out+=["",sep2,f"  Resume: {resume}",
+              "  Every item above is a candidate. Confirm the identities are distinct accounts and",
+              "  that the object is meant to be private before reporting anything as a finding.",sep,""]
+        content="\n".join(out)
+        run_txt=self.work/"result.txt"
+        atomic_text(run_txt,content)
+        print(f"[report] result.txt -> {run_txt}",flush=True)
+        if getattr(self.args,"no_kali_share",False):
+            return run_txt
+        share=Path(KALI_SHARE_RESULTS)
+        target=share/f"{re.sub(r'[^A-Za-z0-9._-]','_',self.host)}-{self.run_id}.txt"
+        try:
+            share.mkdir(parents=True,exist_ok=True)
+            atomic_text(target,content)
+            print(f"[report] result.txt -> {target}",flush=True)
+        except OSError as e:
+            # A missing share mount must never fail a run that already has its result.
+            print(f"[report] shared evidence mount unavailable ({e}); result is in {run_txt}",flush=True)
+        return run_txt
+
     def generate_reports(self,rc:int)->None:
         self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=f"autorecon {self.seed} --resume {self.run_id} --output-dir {self.out}"
         report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"vulnerability_claims":[],"stages":stages}
@@ -1466,6 +1570,11 @@ class Runner:
         lines += [f"| {s['id']} | {s['status']} | {s['processed']}/{s['total']} | {s['runtime_seconds']}s | {s['failure_reason'] or ''} |" for s in stages]
         lines += ["\n## Evidence\n",f"- Raw evidence: `{self.raw}`",f"- Commands: `{self.command_log}`",f"- Scope decisions: `{self.scope_log}`","\n## Vulnerability claims\n\nNo automated candidate is represented as a validated vulnerability.",f"\n## Resume\n\n`{resume}`\n"]
         (self.work/"report.md").write_text("\n".join(lines))
+        try:
+            self.write_result_txt(report["status"],resume,stages)
+        except OSError as e:
+            # report.json and report.md are already on disk; a result.txt failure must not lose them.
+            print(f"[report] result.txt could not be written: {e}",file=sys.stderr,flush=True)
 
 def fmt(sec:float)->str:
     sec=max(0,int(sec)); return f"{sec//3600:02d}:{sec%3600//60:02d}:{sec%60:02d}"

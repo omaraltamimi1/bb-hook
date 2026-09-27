@@ -70,9 +70,11 @@ def load_tests(loader,tests,pattern):
  import tests.stage_coverage as stage_coverage
  import tests.access_matrix as access_matrix
  import tests.web_intelligence as web_intelligence
+ import tests.reporting as reporting
  tests.addTests(loader.loadTestsFromModule(stage_coverage))
  tests.addTests(loader.loadTestsFromModule(access_matrix))
  tests.addTests(loader.loadTestsFromModule(web_intelligence))
+ tests.addTests(loader.loadTestsFromModule(reporting))
  return tests
 
 if __name__=='__main__':unittest.main(verbosity=2)
