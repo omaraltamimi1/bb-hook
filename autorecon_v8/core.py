@@ -869,7 +869,16 @@ class Runner:
         self.started=time.monotonic(); self.started_at=now(); self.global_deadline=self.started+args.global_timeout if args.global_timeout else float("inf")
         self.out=Path(args.output_dir).resolve(); self.out.mkdir(parents=True,exist_ok=True); os.chmod(self.out,0o700)
         self.run_id=args.resume if args.resume not in (None,"last") else (self._last_id() if args.resume=="last" else dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")+"-"+hashlib.sha256(self.seed.encode()).hexdigest()[:8])
-        self.work=self.out/self.run_id; self.raw=self.work/"raw-artifacts"; self.raw.mkdir(parents=True,exist_ok=True); os.chmod(self.work,0o700)
+        self.work=self.out/self.run_id
+        if args.resume not in (None,"last") and not (self.work/"run-state.json").exists():
+            # An explicit --resume asks to continue one specific run. Creating the directory instead
+            # turns a mistyped run id into a fresh empty run wearing the old run's name, which then
+            # publishes a clean result.txt for a run that never happened. Refuse, and name the runs
+            # that do exist so the correct id is one copy-paste away.
+            known=sorted(p.name for p in self.out.glob("*") if (p/"run-state.json").exists())
+            hint=("known runs: "+", ".join(known[-5:])) if known else f"no runs found in {self.out}"
+            raise ValueError(f"--resume {self.run_id!r} is not a run in {self.out} (no run-state.json); {hint}")
+        self.raw=self.work/"raw-artifacts"; self.raw.mkdir(parents=True,exist_ok=True); os.chmod(self.work,0o700)
         self.state_path=self.work/"run-state.json"; self.command_log=self.work/"commands.jsonl"; self.scope_log=self.work/"scope-decisions.jsonl"
         self.scope=Scope(self.host,args.scope_include,args.scope_exclude,args.strict_scope)
         self.current: str | None = None
