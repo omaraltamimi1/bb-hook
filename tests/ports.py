@@ -7,6 +7,7 @@ at start+tool_timeout, so the number of hosts a run could port-scan was a functi
 with stage_timeout irrelevant. One slow unit discarded the whole stage.
 """
 import shutil
+import socket
 import tempfile
 import time
 import unittest
@@ -23,6 +24,65 @@ def build(tmp, extra=()):
     args = apply_profile_defaults(parser().parse_args(
         ["127.0.0.1", "--output-dir", tmp, "--only", "ports", "--port-services", *extra]))
     return core.Runner(args)
+
+
+import ipaddress
+import autorecon_v8.core as _core_mod
+
+
+
+def single_host_dns(testcase, host="a.example.com", addr="203.0.113.7"):
+    """Pin one hostname to one address and return that address.
+
+    The ports stage resolves names to addresses itself, so a test that lets DNS decide, or that
+    stubs naabu with a name, tests nothing. Real naabu answers with "address:port"; these tests
+    now do the same, which also exercises the address-to-name mapping back.
+    """
+    real=core.socket.getaddrinfo
+    def resolve(name,*a,**k):
+        if name==host: return [(socket.AF_INET,socket.SOCK_STREAM,6,"",(addr,0))]
+        return real(name,*a,**k)
+    core.socket.getaddrinfo=resolve
+    testcase.addCleanup(setattr,core.socket,"getaddrinfo",real)
+    return addr
+
+
+def _looks_like_address(name):
+    """True when the value is already an address, so the stub below passes it through to real DNS."""
+    try:
+        ipaddress.ip_address(str(name))
+        return True
+    except ValueError:
+        return False
+
+
+def stub_dns(testcase):
+    """Give every synthetic hostname a stable address.
+
+    The ports stage resolves names to addresses before calling naabu, because naabu's own resolver is
+    not dependable: this build fails every hostname with "no valid ipv4 or ipv6 targets were found"
+    while -list against a literal address works fine. The tests use hostnames that do not exist in
+    DNS, so resolution is stubbed. Every assertion is about chunking, parsing or nmap gating; none of
+    them weaken, and the mapping back from address to name is exercised for real.
+    """
+    real = _core_mod.socket.getaddrinfo
+    seen = {}
+    def fake(name, *a, **k):
+        # An address maps to itself. Sending one to real DNS would fail for the documentation
+        # ranges the tests use (192.0.2.0/24 and friends are reserved and never resolve), which would
+        # drop those hosts and quietly change every chunk count.
+        if _looks_like_address(name):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (str(name), 0))]
+        # One distinct address per name, handed out in first-seen order. Deriving it from hash()
+        # collides, and two names sharing an address means naabu's "addr:port" row gets attributed
+        # to both of them - which silently inflates the port count and the chunk arithmetic.
+        addr = seen.get(name)
+        if addr is None:
+            addr = "203.0.113." + str((len(seen) % 250) + 1)
+            seen[name] = addr
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, 0))]
+    _core_mod.socket.getaddrinfo = fake
+    testcase.addCleanup(setattr, _core_mod.socket, "getaddrinfo", real)
 
 
 class BudgetHarness:
@@ -67,6 +127,7 @@ class TestPortsUnits(unittest.TestCase):
     def stage(self, hosts):
         st = StageState(id="ports", name="ports", description="", dependencies=[])
         self.run.inputs = lambda sid, hosts=hosts: list(hosts)
+        stub_dns(self)
         self.run.ports_stage(st, time.monotonic() + 3600)
         return st
 
@@ -200,13 +261,26 @@ class TestFingerprintRanking(TestPortsUnits):
         self.run = build(self.tmp, ("--tool-timeout", "300", *extra))
         fingerprinted = []
 
+        # One stable address per host, and the reverse, so the stub can emit exactly what real naabu
+        # emits: "address:port". The stage resolves names to addresses itself and maps the addresses
+        # back to names afterwards, so a stub that answered with names would test nothing real.
+        addr_of={host:"203.0.113.%d"%(i+1) for i,host in enumerate(opened)}
+        name_of={a:h for h,a in addr_of.items()}
+        real=core.socket.getaddrinfo
+        def resolve(name,*a,**k):
+            if name in addr_of:
+                return [(socket.AF_INET,socket.SOCK_STREAM,6,"",(addr_of[name],0))]
+            return real(name,*a,**k)
+        core.socket.getaddrinfo=resolve
+        self.addCleanup(setattr,core.socket,"getaddrinfo",real)
+
         def hook(stage, cmd, target, deadline, output, cwd=None):
             output = Path(output)
             output.parent.mkdir(parents=True, exist_ok=True)
             if "-list" in cmd:                        # naabu: emit exactly the map we were given
-                hosts = [l for l in Path(str(cmd[-1])).read_text().splitlines() if l.strip()]
-                output.write_text("".join(f"{h}:{p}\n" for h, ports in opened.items()
-                                          for p in ports if h in hosts))
+                addrs=[l.strip() for l in Path(str(cmd[-1])).read_text().splitlines() if l.strip()]
+                output.write_text("".join(f"{a}:{p}\n" for a in addrs
+                                          for p in opened.get(name_of.get(a,""),[])))
                 return 0
             fingerprinted.append(target)             # nmap: argv[-1] is the host
             output.write_text("")
@@ -246,11 +320,12 @@ class TestFingerprintRanking(TestPortsUnits):
         """A flag that is parsed, stored and then dropped is the quietest kind of no-op."""
         seen = []
         self.run = build(self.tmp, ("--tool-timeout", "300", "--nmap-version-intensity", "9"))
+        addr = single_host_dns(self)
 
         def hook(stage, cmd, target, deadline, output, cwd=None):
             output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
             if "-list" in cmd:
-                output.write_text("a.example.com:22\n"); return 0
+                output.write_text(f"{addr}:22\n"); return 0
             seen.append(cmd); output.write_text(""); return 0
 
         self.run.command = hook
@@ -265,11 +340,12 @@ class TestFingerprintRanking(TestPortsUnits):
         """nmap's own default is left alone rather than pinned to 0, which is not the same thing."""
         seen = []
         self.run = build(self.tmp, ("--tool-timeout", "300",))
+        addr = single_host_dns(self)
 
         def hook(stage, cmd, target, deadline, output, cwd=None):
             output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
             if "-list" in cmd:
-                output.write_text("a.example.com:22\n"); return 0
+                output.write_text(f"{addr}:22\n"); return 0
             seen.append(cmd); output.write_text(""); return 0
 
         self.run.command = hook
@@ -283,6 +359,7 @@ class TestFingerprintRanking(TestPortsUnits):
         """-p must carry only ports naabu confirmed, unusual-first, so nmap cannot scan on its own."""
         seen = []
         self.run = build(self.tmp, ("--tool-timeout", "300",))
+        addr = single_host_dns(self)
 
         def hook(stage, cmd, target, deadline, output, cwd=None):
             output = Path(output); output.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +424,113 @@ class TestPortHelpers(unittest.TestCase):
 
     def test_resolve_tool_reports_a_missing_tool_as_missing(self):
         self.assertIsNone(resolve_tool("definitely-not-installed-9x2"))
+
+
+class TestThePortScanCannotDisagreeWithHttpx(unittest.TestCase):
+    """The bykea run: ports reported "no open port was confirmed on any host" on a target where
+    httpx had just listed 13 hosts serving HTTPS. A port scan that cannot see a port that is provably
+    open is worse than no port scan - it is a false negative wearing a confident label. The stage has
+    to notice the contradiction out loud instead of reporting a clean scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_zero_ports_over_a_proven_live_host_is_called_a_contradiction(self):
+        run = build(self.tmp, ("--tool-timeout", "60"))
+        # httpx's own output, as this run left it: these hosts were serving.
+        httpx = Path(run.raw) / "httpx" / "normalized.txt"
+        httpx.parent.mkdir(parents=True, exist_ok=True)
+        httpx.write_text("https://api.example.com/\nhttps://www.example.com/\n")
+        addr = single_host_dns(self, "api.example.com")
+
+        def silent(stage, cmd, target, deadline, output, cwd=None):
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Path(output).write_text("")        # naabu answers, and finds nothing
+            return 0
+
+        run.command = silent
+        run.inputs = lambda sid: ["api.example.com"]
+        st = StageState(id="ports", name="ports", description="", dependencies=[])
+        run.ports_stage(st, time.monotonic() + 3600)
+        reason = st.failure_reason or ""
+        self.assertEqual(st.status, "failed")
+        self.assertIn("httpx had already proven", reason,
+                      f"a port scan that missed a proven-open port did not say so: {reason!r}")
+        self.assertIn("provably open", reason, "the contradiction was reported without its meaning")
+
+    def test_no_contradiction_is_claimed_when_httpx_found_nothing(self):
+        """The detector must not cry contradiction on a genuinely quiet target, or it is just noise."""
+        run = build(self.tmp, ("--tool-timeout", "60"))
+        httpx = Path(run.raw) / "httpx" / "normalized.txt"
+        httpx.parent.mkdir(parents=True, exist_ok=True)
+        httpx.write_text("")
+        single_host_dns(self, "quiet.example.com")
+
+        def silent(stage, cmd, target, deadline, output, cwd=None):
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Path(output).write_text("")
+            return 0
+
+        run.command = silent
+        run.inputs = lambda sid: ["quiet.example.com"]
+        st = StageState(id="ports", name="ports", description="", dependencies=[])
+        run.ports_stage(st, time.monotonic() + 3600)
+        self.assertNotIn("provably open", st.failure_reason or "",
+                         "a contradiction was claimed where httpx had proven nothing")
+
+
+class TestUnresolvableHostsAreNamed(unittest.TestCase):
+    """The bykea ports input contained a literal "*api.bykea.net" and a run of names that do not
+    resolve. Dropping them silently makes the host count lie: the report says it scanned N hosts when
+    it scanned fewer, and the ones it skipped are exactly the ones an operator would want to know
+    about."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_a_name_that_does_not_resolve_is_reported_by_name(self):
+        run = build(self.tmp, ("--tool-timeout", "60"))
+        real = core.socket.getaddrinfo
+        def resolve(name, *a, **k):
+            if name == "good.example.com":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.5", 0))]
+            raise OSError("no address associated with hostname")
+        core.socket.getaddrinfo = resolve
+        self.addCleanup(setattr, core.socket, "getaddrinfo", real)
+
+        def quiet(stage, cmd, target, deadline, output, cwd=None):
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Path(output).write_text("203.0.113.5:443\n")
+            return 0
+
+        run.command = quiet
+        run.inputs = lambda sid: ["good.example.com", "*wild.example.com", "dead.example.com"]
+        st = StageState(id="ports", name="ports", description="", dependencies=[])
+        run.ports_stage(st, time.monotonic() + 3600)
+        reason = st.failure_reason or ""
+        self.assertIn("did not resolve", reason,
+                      f"unresolvable hosts were dropped without being named: {reason!r}")
+        self.assertIn("dead.example.com", reason, "the unresolvable host was not named")
+
+    def test_a_wildcard_entry_is_never_treated_as_a_hostname(self):
+        """A certificate wildcard leaked into the subdomain list. Handed to naabu it can never resolve,
+        and naabu's "no valid targets" error says nothing about which entry caused it."""
+        run = build(self.tmp, ("--tool-timeout", "60"))
+        single_host_dns(self, "good.example.com")
+
+        def quiet(stage, cmd, target, deadline, output, cwd=None):
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Path(output).write_text("")
+            return 0
+
+        run.command = quiet
+        run.inputs = lambda sid: ["good.example.com", "*api.example.com"]
+        st = StageState(id="ports", name="ports", description="", dependencies=[])
+        run.ports_stage(st, time.monotonic() + 3600)
+        self.assertIn("*api.example.com", st.failure_reason or "",
+                      "a literal wildcard was not named as the thing that could not be scanned")
 
 
 if __name__ == "__main__":

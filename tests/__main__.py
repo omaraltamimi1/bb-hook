@@ -36,7 +36,7 @@ class Integration(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    b=Path(d)/'bin';b.mkdir()
    scripts={
-    'subfinder':'#!/bin/sh\nprintf "api.example.com\\nwww.example.com\\n"\n',
+    'subfinder':'#!/bin/sh\nprintf "localhost\\nwww.example.com\\n"\n',
     'dnsx':'#!/bin/sh\ncat "$(printf "%s\\n" "$@" | tail -1)"\n',
     'httpx':'#!/bin/sh\nwhile read h; do printf "https://%s/\\n" "$h"; done < "$(printf "%s\\n" "$@" | tail -1)"\n',
     'naabu':'#!/bin/sh\nwhile read h; do printf "%s:443\\n" "$h"; done < "$(printf "%s\\n" "$@" | tail -1)"\n',
@@ -45,7 +45,11 @@ class Integration(unittest.TestCase):
    env=os.environ.copy();env['PATH']=str(b)+os.pathsep+env['PATH']
    r=self.run_cli('example.com','--only','subdomains,dnsx,httpx,ports','--output-dir',d,env=env);self.assertEqual(r.returncode,0,r.stderr)
    rid=(Path(d)/'last').read_text();raw=Path(d)/rid/'raw-artifacts'
-   expected={'api.example.com','www.example.com','example.com'}
+   # localhost rather than a made-up example.com subdomain: the ports stage resolves names
+   # itself now, so a name that does not exist in DNS is honestly reported as unscannable and
+   # dropped. Every name here has to resolve for this test to exercise the chain rather than the
+   # resolver.
+   expected={'localhost','www.example.com','example.com'}
    self.assertEqual(set((raw/'dnsx/normalized.txt').read_text().splitlines()),expected)
    self.assertEqual(set((raw/'httpx/normalized.txt').read_text().splitlines()),{f'https://{h}/' for h in expected})
    self.assertEqual(set((raw/'ports/normalized.txt').read_text().splitlines()),{f'{h}:443' for h in expected})
