@@ -13,7 +13,9 @@ So the property is asserted empirically rather than by reading the code: every s
 the real dispatch with no input, and none of them may end up completed with nothing to say for itself.
 A stage that has nothing to do says so, with a reason.
 """
+import json
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -386,6 +388,77 @@ class TestCrawlDoesNotLoseTheRun(unittest.TestCase):
         st = self.stage(run)
         self.assertEqual(st.processed, 20,
                          "a crawl that spawned per-seed invocations did not account for all seeds")
+
+
+class TestProgramScopeRulesActuallyMatch(unittest.TestCase):
+    """A program scope hands you mid-label wildcards: developer*.earlywarning.com is an in-scope row
+    and ccpa*.zellepay.com is a row the program marked ineligible. The old exact-or-suffix test matched
+    neither. An include that matches nothing is silent under-coverage; an exclude that matches nothing
+    is the worse case, because the run walks into a no-bounty host and the report dies at triage."""
+
+    def test_mid_label_include_matches(self):
+        from autorecon_v8.core import Runner
+        scope = Runner.__dict__.get("Scope")
+        scope = scope or [v for k, v in vars(sys.modules["autorecon_v8.core"]).items()
+                          if k.endswith("Scope") and hasattr(v, "match")][0]
+        for host, rule, want in [
+            ("developer-portal.earlywarning.com", "developer*.earlywarning.com", True),
+            ("developers.earlywarning.com", "developer*.earlywarning.com", True),
+            ("support.earlywarning.com", "developer*.earlywarning.com", False),
+            ("ccpa-api.zellepay.com", "ccpa*.zellepay.com", True),
+            ("api.zmsp.prod.earlywarning.io", "api.zmsp.*.earlywarning.io", True),
+        ]:
+            self.assertEqual(scope.match(host, rule), want, f"{rule} vs {host}")
+
+    def test_an_explicit_host_does_not_leak_the_whole_domain(self):
+        """--scope-exclude api.zellepay.com must not take api.earlywarning.com with it, and must not
+        take the rest of the domain either: it is a specific ineligible row, not a domain ban."""
+        from autorecon_v8.core import Runner
+        scope = Runner.__dict__.get("Scope")
+        scope = scope or [v for k, v in vars(sys.modules["autorecon_v8.core"]).items()
+                          if k.endswith("Scope") and hasattr(v, "match")][0]
+        self.assertTrue(scope.match("api.zellepay.com", "api.zellepay.com"))
+        self.assertFalse(scope.match("web.zellepay.com", "api.zellepay.com"))
+
+
+class TestArjunBatching(unittest.TestCase):
+    """access-checks never ran on the whatnot run because arjun's one invocation hit the stage
+    deadline and arjun only writes -o when it finishes, so the stage yielded no JSON at all."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+
+    def run_arjun(self, urls, fake_command):
+        run = build(self.tmp, "arjun")
+        run.read = lambda sid, v=list(urls): list(v)
+        st = StageState(id="arjun", name="arjun", description="", dependencies=[])
+        run.stages = {"arjun": st}
+        run.command = fake_command
+        run.execute(st)
+        return st, run
+
+    def test_one_killed_batch_does_not_discard_the_others(self):
+        seen = []
+        def command(stage, cmd, target, deadline, output, cwd=None):
+            seen.append(cmd)
+            i = cmd.index("-i"); batch_file = cmd[i + 1]
+            targets = Path(batch_file).read_text().split()
+            o = cmd[cmd.index("-o") + 1]
+            # The second batch dies the way the live run did: killed, no JSON written.
+            if len(seen) == 2:
+                return 124
+            Path(o).write_text(json.dumps({targets[0]: {"params": ["id"], "method": "GET"}}))
+            return 0
+        st, run = self.run_arjun([f"https://h{i}.example.com/p" for i in range(6)], command)
+        self.assertGreater(len(seen), 1, "arjun ran as a single invocation again")
+        text = (Path(run.raw) / "arjun" / "normalized.txt").read_text()
+        self.assertIn("h0.example.com", text, "a killed batch discarded the batches around it")
+        self.assertEqual(st.status, "partial", "a killed batch was reported as a clean stage")
+        self.assertTrue(st.failure_reason)
+        self.assertEqual(st.exit_code, 1,
+                         "a killed batch left the stage exit code at 0, so the report reads clean")
 
 
 if __name__ == "__main__":
