@@ -24,6 +24,7 @@ Scope tests must therefore pass it explicitly, or they assert nothing.
 
 import json
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,48 @@ def flag(cmd, name):
         if token.startswith(prefix):
             return token[len(prefix):]
     return None
+
+
+import ipaddress
+import autorecon_v8.core as _core_mod
+
+
+def _looks_like_address(name):
+    """True when the value is already an address, so the stub below passes it through to real DNS."""
+    try:
+        ipaddress.ip_address(str(name))
+        return True
+    except ValueError:
+        return False
+
+
+def stub_dns(testcase):
+    """Give every synthetic hostname a stable address.
+
+    The ports stage resolves names to addresses before calling naabu, because naabu's own resolver is
+    not dependable: this build fails every hostname with "no valid ipv4 or ipv6 targets were found"
+    while -list against a literal address works fine. The tests use hostnames that do not exist in
+    DNS, so resolution is stubbed. Every assertion is about chunking, parsing or nmap gating; none of
+    them weaken, and the mapping back from address to name is exercised for real.
+    """
+    real = _core_mod.socket.getaddrinfo
+    seen = {}
+    def fake(name, *a, **k):
+        # An address maps to itself. Sending one to real DNS would fail for the documentation
+        # ranges the tests use (192.0.2.0/24 and friends are reserved and never resolve), which would
+        # drop those hosts and quietly change every chunk count.
+        if _looks_like_address(name):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (str(name), 0))]
+        # One distinct address per name, handed out in first-seen order. Deriving it from hash()
+        # collides, and two names sharing an address means naabu's "addr:port" row gets attributed
+        # to both of them - which silently inflates the port count and the chunk arithmetic.
+        addr = seen.get(name)
+        if addr is None:
+            addr = "203.0.113." + str((len(seen) % 250) + 1)
+            seen[name] = addr
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, 0))]
+    _core_mod.socket.getaddrinfo = fake
+    testcase.addCleanup(setattr, _core_mod.socket, "getaddrinfo", real)
 
 
 class TestUnitTiming(unittest.TestCase):
@@ -139,6 +182,7 @@ class Harness(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.captured = []
+        stub_dns(self)
 
     def build(self, argv, seed=None):
         """Create a run dir, seed stage artifacts, return a Runner.

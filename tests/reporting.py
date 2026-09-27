@@ -6,6 +6,7 @@ candidate as a confirmed vulnerability is worse than no file at all.
 """
 
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -16,7 +17,7 @@ import unittest
 
 from autorecon_v8.cli import apply_profile_defaults, parser
 import autorecon_v8.core as core_module
-from autorecon_v8.core import Runner, atomic_text
+from autorecon_v8.core import KALI_SHARE_MOUNT, KALI_SHARE_SUBDIR, Runner, atomic_text
 
 
 _pending: dict = {}
@@ -209,11 +210,14 @@ class ResultTxt(unittest.TestCase):
         import os
         if not (os.path.ismount("/dev/shm") and os.access("/dev/shm", os.W_OK)):
             self.skipTest("no writable mount available on this host")
-        self.patched_mount("/dev/shm")
-        self.shared.generate_reports(0)
-        mirrored = list(pathlib.Path("/dev/shm/autorecon-results").glob("*-*.txt"))
-        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", True)
-        self.assertTrue(mirrored, "a writable mount produced no mirror; the guard refuses unconditionally")
+        # Opting in is the point: the mirror is written only when a directory is named. This still
+        # proves the write path is not just always refusing, which is what it was written to prove.
+        opt_in = build(self.tmp, ("--share-dir", "/dev/shm"), mirror=True)
+        opt_in.write_result_txt("ok", "resume", [])
+        mirrored = list(pathlib.Path("/dev/shm").glob("*-*.txt"))
+        for stray in mirrored:
+            self.addCleanup(stray.unlink, True)
+        self.assertTrue(mirrored, "a writable, named directory produced no mirror; the path always refuses")
 
     def test_a_mount_that_is_not_writable_keeps_the_result(self):
         """A real mount that is not writable must degrade, not fail."""
@@ -251,10 +255,11 @@ class ResultTxt(unittest.TestCase):
     def test_the_warning_goes_to_stderr_not_stdout(self):
         """result.txt is assembled from captured stdout, so a warning on stdout reads like a finding."""
         import contextlib, io
-        self.patched_mount("/definitely/not/a/mount")
+        # A named directory that does not exist must still warn, and the warning belongs on stderr.
+        broken = build(self.tmp, ("--share-dir", "/definitely/not/a/mount"), mirror=True)
         err, out = io.StringIO(), io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
-            self.shared.generate_reports(0)
+            broken.write_result_txt("ok", "resume", [])
         self.assertIn("unavailable", err.getvalue(), "no warning was emitted on stderr")
         self.assertNotIn("unavailable", out.getvalue(),
                          "the warning leaked onto stdout, where it is indistinguishable from output")
@@ -459,6 +464,126 @@ class TestOneVersionNumber(unittest.TestCase):
         self.assertIsNotNone(found, "pyproject.toml has no static version to compare")
         self.assertEqual(found.group(1), __version__,
                          "pyproject.toml and the package disagree on the version")
+
+
+class TestOneResultOneLine(unittest.TestCase):
+    """A run that fails a stage emits a partial report from the failure path and then runs the report
+    stage, which regenerated the identical file and announced it again. Two "[report] result.txt ->"
+    lines per run, each naming two destinations, is what made this look like four separate results."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+
+    def runner(self, argv=()):
+        return build(self.tmp, *argv)
+
+    def test_the_report_is_announced_once_per_run(self):
+        run = self.runner()
+        lines = []
+        real = print
+
+        def spy(*a, **k):
+            text = " ".join(str(x) for x in a)
+            if "result.txt ->" in text:
+                lines.append(text)
+            return real(*a, **k)
+
+        import builtins
+        builtins.print = spy
+        self.addCleanup(setattr, builtins, "print", real)
+        run.write_result_txt("partial", "resume", [])
+        run.write_result_txt("partial", "resume", [])  # failure path, then the report stage
+        self.assertEqual(len(lines), 1,
+                         f"identical report content was announced {len(lines)} times: {lines}")
+
+    def test_one_result_file_is_written_by_default(self):
+        run = self.runner()
+        os.environ.pop("KALI_SHARE_DIR", None)
+        out = run.write_result_txt("ok", "resume", [])
+        self.assertTrue(out.exists(), "no result.txt was written")
+        self.assertEqual(out.parent, Path(run.work),
+                         "the result did not land in the run directory")
+        self.assertFalse((Path(run.work) / "result.txt").read_text().count("[STAGE SUMMARY]") > 1,
+                         "the result contains more than one report body")
+
+    def test_the_evidence_mount_is_not_written_without_being_named(self):
+        """The share copy used to be unconditional, which is how files landed in /mnt/KaliShare on a
+        run that was never asked for it. It now needs --share-dir."""
+        # The share branch has to actually be reachable for this to mean anything, and the test
+        # helper adds --no-kali-share by default, which short-circuits it. The mount constant is
+        # pointed at a real tmpfs mount, so a regression that writes by default writes there and is
+        # caught - and the operator's real share is never the target.
+        import autorecon_v8.core as core
+        real_mount = core.KALI_SHARE_MOUNT
+        core.KALI_SHARE_MOUNT = "/dev/shm"
+        self.addCleanup(setattr, core, "KALI_SHARE_MOUNT", real_mount)
+        run = build(self.tmp, (), mirror=True)     # mirror=True: no --no-kali-share
+        os.environ.pop("KALI_SHARE_DIR", None)
+        before = set()
+        mount = Path("/dev/shm") / KALI_SHARE_SUBDIR
+        mount.mkdir(parents=True, exist_ok=True)
+        # Compared by name AND mtime, not by name alone. Two runs inside the same second get the same
+        # run id, so a write that overwrites a file an earlier test left behind leaves the name set
+        # identical - and a name-only comparison passed while the regression was live.
+        def snapshot():
+            return {p.name: p.stat().st_mtime_ns for p in mount.iterdir()} if mount.is_dir() else {}
+        # build() runs a CLI dry-run whose own report stage already wrote a result.txt into this run
+        # directory, and write_result_txt skips a rewrite when the file is already byte-identical, so
+        # without this the call returns before it ever reaches the share branch.
+        stale = Path(run.work) / "result.txt"
+        if stale.exists():
+            stale.unlink()
+        before = snapshot()
+        run.write_result_txt("ok", "resume", [])
+        after = snapshot()
+        for name in set(after) - set(before):
+            self.addCleanup((mount / name).unlink, True)
+        touched = sorted(n for n in set(before) & set(after) if before[n] != after[n])
+        self.assertEqual((set(after) - set(before)), set(),
+                         "a result file appeared on the evidence mount with no --share-dir: "
+                         f"{sorted(set(after) - set(before))}")
+        self.assertEqual(touched, [],
+                         "an existing file on the evidence mount was rewritten with no --share-dir: "
+                         f"{touched}")
+
+
+class TestTheRunAnnouncesItsResultOnce(unittest.TestCase):
+    """A CLI-level count, because the bug lived in the run loop, not in the writer.
+
+    write_result_txt called twice in a row is not the same thing as a run calling it twice: the run
+    reaches it from the report stage inside the loop and again from the finally block. Asserting on
+    the writer alone passed while the run still announced every result twice.
+    """
+
+    def test_a_full_run_announces_its_result_exactly_once(self):
+        import subprocess, tempfile as tf
+        with tf.TemporaryDirectory() as d:
+            env = dict(os.environ, AUTORECON_KALI_SHARE="/mnt/KaliShare")
+            r = subprocess.run(
+                ["autorecon", "https://127.0.0.1:1/",
+                 "--output-dir", d, "--only", "report", "--no-kali-share", "--global-timeout", "60"],
+                capture_output=True, text=True, env=env, timeout=300)
+            announced = [l for l in (r.stdout + r.stderr).splitlines() if "result.txt ->" in l]
+            self.assertEqual(len(announced), 1,
+                             f"one run announced its result {len(announced)} times: {announced}")
+
+    def test_a_failing_stage_still_announces_exactly_once(self):
+        """The finally block is the safety net for a run that never reaches the report stage. It has
+        to fire in that case, and stay quiet otherwise - both halves, or it is either dead code or a
+        second announcement."""
+        import subprocess, tempfile as tf
+        with tf.TemporaryDirectory() as d:
+            env = dict(os.environ, AUTORECON_KALI_SHARE="/mnt/KaliShare")
+            r = subprocess.run(
+                ["autorecon", "https://127.0.0.1:1/",
+                 "--output-dir", d, "--only", "report,dns", "--no-kali-share",
+                 "--global-timeout", "60", "--stage-timeout", "0.001"],
+                capture_output=True, text=True, env=env, timeout=300)
+            announced = [l for l in (r.stdout + r.stderr).splitlines() if "result.txt ->" in l]
+            self.assertLessEqual(len(announced), 1,
+                                 f"a run that reached the report stage announced {len(announced)} times: {announced}")
 
 
 if __name__ == "__main__":

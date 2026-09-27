@@ -12,6 +12,7 @@ import math
 import json
 import os
 import re
+import socket
 import shutil
 import signal
 import subprocess
@@ -1131,6 +1132,7 @@ class Runner:
             print("autorecon: preflight: "+", ".join(f"{s} needs {t} (not found)" for s,t in absent)
                   +f" -- {len(absent)} stage(s) will report a skip with this reason; the run continues",
                   file=sys.stderr,flush=True)
+        self._report_written=False
         blocked=[s for s in STAGE_IDS if s in self.selected and s in UNIMPLEMENTED]
         if blocked:
             print("autorecon: warning: unimplemented stage(s) scheduled: "+", ".join(blocked)+" -- these will be reported as unimplemented, not completed",file=sys.stderr,flush=True)
@@ -1151,7 +1153,13 @@ class Runner:
         except Deadline: rc=124; self.mark_current("partial","stage or global deadline expired",124)
         except Exception as e: rc=1; self.mark_current("failed",f"{type(e).__name__}: {e}",1); print(f"autorecon: unexpected error: {type(e).__name__}: {e}",file=sys.stderr,flush=True)
         finally:
-            self.generate_reports(rc); self.save()
+            # The report stage already generated the report inside the loop. This block is the
+            # safety net for a run that never reached it - an interrupt, a deadline, a stage
+            # that raised - so it only runs when the stage did not. Running both made every run
+            # announce its result twice, and each announcement named two destinations, which
+            # read as four separate results for one scan.
+            if not self._report_written: self.generate_reports(rc)
+            self.save()
         if rc: print(f"Resume with: {self.resume_command()}",file=sys.stderr,flush=True)
         elif not self.args.keep_temp: shutil.rmtree(self.work/"tmp",ignore_errors=True)
         return rc
@@ -1740,6 +1748,24 @@ class Runner:
         print(f"[screenshots] captured {len(shots)} image(s) under {root}",flush=True)
         if rc: st.status="partial"; st.failure_reason=f"httpx exited {rc} but {len(shots)} image(s) were captured"
 
+    def host_served(self,host:str)->bool:
+        """True when this run's own httpx stage already proved `host` was serving HTTP.
+
+        Read from httpx's normalized output rather than assumed, so the ports stage can catch itself
+        contradicting an earlier stage instead of quietly reporting a port scan that saw nothing.
+        """
+        path=self.raw/"httpx"/"normalized.txt"
+        if not path.exists(): return False
+        target=host.strip().lower()
+        if not target: return False
+        for line in path.read_text(errors="replace").splitlines():
+            line=line.strip().lower()
+            if not line: continue
+            try: h=urlsplit(line if "//" in line else "//"+line).hostname
+            except ValueError: h=None
+            if h and h.rstrip(".").lower()==target: return True
+        return False
+
     def ports_stage(self,st:StageState,deadline:float)->None:
         hosts=self.inputs(st.id); st.total=len(hosts); st.inputs=[str(x) for x in hosts]
         root=self.raw/st.id; dest=root/"normalized.txt"; st.outputs=[str(dest)]
@@ -1757,21 +1783,63 @@ class Runner:
         # that reads like "no open ports" when it never got to ask. A chunk that is killed no longer
         # discards the chunks before it.
         chunk=max(1,int(getattr(self.args,"ports_chunk",0) or 25))
-        chunks=[hosts[i:i+chunk] for i in range(0,len(hosts),chunk)]
+        # Resolve the names here and hand naabu addresses. naabu's own resolver is not dependable -
+        # the build in this environment fails every hostname with "no valid ipv4 or ipv6 targets were
+        # found" while -list against a literal address works fine, so feeding it names produced zero
+        # rows on every chunk and the stage reported "no open port was confirmed on any host" on a run
+        # where httpx had just proven 13 hosts serving HTTPS. A port scan that cannot see a port that
+        # is provably open is worse than no port scan: it is a false negative with a confident label.
+        # Names are mapped back onto the addresses afterwards, so the output still reads host:port.
+        resolved:dict[str,list[str]]={}; unresolvable:list[str]=[]
+        for host in hosts:
+            name=str(host).strip()
+            if not name or name.startswith("*"):
+                unresolvable.append(name or "(empty)"); continue
+            try:
+                infos=socket.getaddrinfo(name,None,type=socket.SOCK_STREAM)
+            except OSError:
+                unresolvable.append(name); continue
+            addrs=sorted({str(i[4][0]) for i in infos})
+            if not addrs: unresolvable.append(name)
+            else: resolved[name]=addrs
+        addr_to_names:dict[str,list[str]]={}
+        for name,addrs in resolved.items():
+            for a in addrs: addr_to_names.setdefault(a,[]).append(name)
+        chunks=[sorted(resolved)[i:i+chunk] for i in range(0,len(resolved),chunk)]
         opened:dict[str,list[int]]={}; failures:list[str]=[]
+        if unresolvable:
+            failures.append(f"{len(unresolvable)} host(s) did not resolve and were not scanned: "
+                            f"{', '.join(unresolvable[:5])}{' ...' if len(unresolvable)>5 else ''}")
         for index,group in enumerate(chunks,1):
             self.check(deadline)
-            input_file=root/f"inputs-{index:04d}.txt"; self.write_lines(input_file,group)
+            label=",".join(group)
+            input_file=root/f"inputs-{index:04d}.txt"
+            self.write_lines(input_file,[a for n in group for a in resolved[n]])
             raw=root/f"naabu-{index:04d}.txt"
-            rc=self.command(st.id,[naabu,"-silent","-list",str(input_file)],group[0],deadline,raw)
+            rc=self.command(st.id,[naabu,"-silent","-list",str(input_file)],label,deadline,raw)
             st.processed+=len(group)
             if rc: failures.append(f"naabu chunk {index}/{len(chunks)} ({len(group)} host(s)) exited {rc}")
-            for host,ports in naabu_open_ports(raw.read_text(errors="replace") if raw.exists() else "").items():
-                opened[host]=sorted(set(opened.get(host,[]))|set(ports))
+            for addr,ports in naabu_open_ports(raw.read_text(errors="replace") if raw.exists() else "").items():
+                for name in addr_to_names.get(addr,[addr]):
+                    opened[name]=sorted(set(opened.get(name,[]))|set(ports))
         self.write_lines(dest,[f"{h}:{p}" for h,ports in sorted(opened.items()) for p in ports])
         if failures: st.exit_code=1
         if not opened:
-            if failures: st.status="failed"; st.failure_reason="; ".join(failures)+"; no open port was confirmed on any host"
+            # httpx already proved which of these hosts are serving. Finding no open port on a host
+            # that was answering HTTP moments earlier is a contradiction, not a clean result, and it
+            # has to say so - otherwise the run reads as "no open ports" and the next person trusts
+            # it. Silence here is how a broken port scan ships as a finding.
+            served=[h for h in hosts if self.host_served(str(h))]
+            reason="; ".join(failures) if failures else "naabu returned no rows"
+            if served:
+                st.status="failed"
+                st.failure_reason=(f"{reason}; no open port was confirmed, but httpx had already proven "
+                                   f"{len(served)} host(s) serving HTTP ({', '.join(sorted(served)[:5])}"
+                                   f"{' ...' if len(served)>5 else ''}) - the port scan did not see ports "
+                                   f"that are provably open")
+            else:
+                st.status="failed" if failures else "completed"
+                st.failure_reason=reason+"; no open port was confirmed on any host" if failures else None
             return
         if not getattr(self.args,"port_services",False):
             if failures: st.status="partial"; st.failure_reason="; ".join(failures)
@@ -2044,9 +2112,12 @@ class Runner:
         """
         One clean human-readable result.txt: the file a human reads to decide what to chase.
 
-        Written to the run directory always, and mirrored to the shared evidence mount
-        best-effort. Only non-empty sections appear, so an empty section never implies a finding
-        that was not there. Everything in it is a candidate, never a validated vulnerability.
+        One file, written to the run directory. A second copy is made only when the operator names a
+        directory with --share-dir; the evidence mount used to be mirrored unconditionally, which is
+        how runs nobody asked put files in /mnt/KaliShare. Re-writing is skipped when the file is
+        already byte-identical, so the same report is not announced twice in one run. Only non-empty
+        sections appear, so an empty section never implies a finding that was not there. Everything
+        in it is a candidate, never a validated vulnerability.
         """
         sep="="*72; sep2="-"*72
         def section(title:str,lines:list[str],cap:int=RESULT_SECTION_CAP)->list[str]:
@@ -2129,12 +2200,27 @@ class Runner:
               "  Every item above is a candidate. Confirm the identities are distinct accounts and",
               "  that the object is meant to be private before reporting anything as a finding.",sep,""]
         content="\n".join(out)
+        # One result, one line. A run that fails a stage emits a partial report from the failure path
+        # and then runs the report stage, which regenerated the identical file and announced it again.
+        # That is what produced two "[report] result.txt ->" lines for the same run, each naming two
+        # destinations. Identical content means there is no second result to announce, so it is not
+        # rewritten and not re-logged.
+        self._report_written=True
         run_txt=self.work/"result.txt"
+        # Skip only when the file on disk is already byte-identical. Comparing against a remembered
+        # digest instead would also skip the rewrite that repairs a result.txt somebody clobbered,
+        # and there is a test that holds this tool to exactly that.
+        if run_txt.exists() and run_txt.read_text(errors="replace")==content:
+            return run_txt
         atomic_text(run_txt,content)
         print(f"[report] result.txt -> {run_txt}",flush=True)
-        if getattr(self.args,"no_kali_share",False):
+        # The shared-evidence copy is opt-in. Writing to the evidence mount by default is what put
+        # files in /mnt/KaliShare on a run that was never asked to, so it now requires --share-dir
+        # (or an explicit KALI_SHARE_DIR in the environment). One file by default, in the run.
+        share_dir=getattr(self.args,"share_dir",None) or os.environ.get("KALI_SHARE_DIR") or None
+        if getattr(self.args,"no_kali_share",False) or not share_dir:
             return run_txt
-        target=self.kali_share_target()
+        target=self.kali_share_target(share_dir)
         if target is None:
             # Warned on stderr so it cannot be mistaken for progress, and never raised: a host with
             # no share must behave exactly like one told not to use it.
@@ -2149,7 +2235,7 @@ class Runner:
             warn(f"shared evidence mount unavailable ({e}); result is in {run_txt}")
         return run_txt
 
-    def kali_share_target(self)->Path|None:
+    def kali_share_target(self,share_dir:str|None=None)->Path|None:
         """
         Where the evidence copy belongs, or None when the share is not really there.
 
@@ -2162,6 +2248,14 @@ class Runner:
         /proc is the honest negative control: always a real mount, never writable, so "mounted but
         unwritable" is reachable in a test without touching the host.
         """
+        # A directory the operator named is taken at its word: it still has to exist and be
+        # writable, and that is the whole check. The default mount keeps the full ismount test,
+        # because writing to an evidence mount nobody asked for is the behaviour being removed.
+        if share_dir:
+            root=Path(share_dir).expanduser()
+            if root.is_dir() and os.access(root,os.W_OK):
+                return root/f"{re.sub(r'[^A-Za-z0-9._-]','_',self.host)}-{self.run_id}.txt"
+            return None
         root=Path(KALI_SHARE_MOUNT)
         if not root.is_dir() or not os.path.ismount(root) or not os.access(root,os.W_OK):
             return None
