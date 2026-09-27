@@ -127,5 +127,140 @@ class TestZeroIsNotEvidence(unittest.TestCase):
         self.assertIn("skipped", row[0])
 
 
+class TestPartialWorkSurvivesInterruption(unittest.TestCase):
+    """A killed run must leave the probes it did, not nothing.
+
+    api-discovery collected every origin's metrics in memory and wrote the file once at stage end, so
+    an interrupted stage left no metrics.jsonl at all - and result.txt then omitted [API ENDPOINTS]
+    entirely, as though no probe had ever run. Evidence of work that happened is the whole point of
+    a raw-artifacts directory.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.run = build(self.tmp, "api-discovery")
+        self.run.inputs = lambda sid: ["https://a.example.com", "https://b.example.com"]
+        self.st = StageState(id="api-discovery", name="api-discovery", description="", dependencies=[])
+        self.run.stages = {"api-discovery": self.st}
+
+    def test_metrics_are_written_before_the_stage_ends(self):
+        """The file has to exist and hold rows even when the stage never reached its end.
+
+        api-discovery probes over HTTP itself rather than through self.command, so the way to
+        interrupt it is the deadline, and execute() turns Deadline into a partial status rather than
+        letting it out.
+        """
+        self.run.args.stage_timeout = 0.01
+        self.run.args.tool_timeout = 0.01
+        self.run.execute(self.st)
+        self.assertIn(self.st.status, ("partial", "failed"),
+                      "the stage was not interrupted as intended")
+        self.assertEqual(self.st.failure_reason, "stage deadline expired")
+        path = Path(self.run.raw) / "api-discovery" / "metrics.jsonl"
+        self.assertTrue(path.exists(),
+                        "metrics.jsonl did not exist until the stage finished; a killed stage loses it")
+        self.assertIn(str(path), self.st.outputs,
+                      "an interrupted stage must still list what it wrote")
+
+    def test_an_interrupted_api_stage_still_yields_an_api_section(self):
+        """The user-visible half of it: result.txt keeps the probes that did complete.
+
+        metrics.jsonl is seeded by hand here, standing in for the rows an interrupted run would have
+        flushed. What is under test is that the reporting side reads a partial file rather than
+        treating its absence as "nothing was found".
+        """
+        import json as j
+        rows = [{"origin": "https://a.example.com", "probe": "openapi",
+                 "url": "https://a.example.com/openapi.json", "status": 200,
+                 "bytes": 2, "timestamp": "now"}]
+        path = Path(self.run.raw) / "api-discovery" / "metrics.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(j.dumps(r) + "\n" for r in rows))
+        self.st.status = "partial"; self.st.failure_reason = "stage deadline expired"
+        self.run.stages = {s: StageState(id=s, name=s, description="", dependencies=[])
+                           for s in STAGE_IDS}
+        self.run.stages["api-discovery"] = self.st
+        self.run.generate_reports(0)
+        text = (Path(self.run.work) / "result.txt").read_text()
+        self.assertIn("API", text.upper())
+        self.assertIn("a.example.com", text,
+                      "result.txt dropped the one origin that had actually been probed")
+
+    def test_the_stream_is_append_only_across_two_runs(self):
+        """A resume must not truncate what the earlier run already found."""
+        import json as j
+        path = Path(self.run.raw) / "api-discovery" / "metrics.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(j.dumps({"origin": "https://first.example.com", "probe": "openapi"}) + "\n")
+        self.run.command = lambda *a, **k: 0
+        self.run.execute(self.st)
+        text = path.read_text()
+        self.assertIn("first.example.com", text,
+                      "a resumed api-discovery overwrote the previous run's metrics")
+
+
+class TestMetricsAreFlushedWhileTheStageRuns(unittest.TestCase):
+    """Asserted by observation, not by reading the code: a probe served mid-stage sees the earlier
+    probe's row already on disk. Collecting rows in memory and writing once at the end passes every
+    test that only inspects the file afterwards, which is the shape of test that let this ship."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_a_probe_served_mid_stage_sees_the_earlier_row_on_disk(self):
+        import json as j
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = Path(self.server.metrics_path)
+                seen[self.server.hits] = path.exists() and bool(path.read_text().strip())
+                self.server.hits += 1
+                body = b'{"openapi":"3.0.0"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        run = build(self.tmp, "api-discovery")
+        run.args.concurrency = 1
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.hits = 0
+        server.metrics_path = str(Path(run.raw) / "api-discovery" / "metrics.jsonl")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+
+        port = server.server_address[1]
+        # Two distinct origins: unique_origins() collapses identical scheme+host+port, and both must
+        # survive that for the second origin's probes to run after the first origin has been emitted.
+        run.inputs = lambda sid: [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
+        st = StageState(id="api-discovery", name="api-discovery", description="", dependencies=[])
+        run.stages = {"api-discovery": st}
+        run.execute(st)
+
+        rows = [json_line for json_line in
+                Path(server.metrics_path).read_text().splitlines() if json_line.strip()]
+        self.assertGreaterEqual(len(rows), 2, f"expected a row per probe, got {len(rows)}")
+        self.assertTrue(seen[0] is False, "the first probe should find nothing written yet")
+        self.assertTrue(any(seen.values()),
+                        "no probe found an earlier probe's metrics already on disk, so the stream "
+                        "is buffered in memory and only written at stage end")
+        import json as j
+        for row in rows:
+            self.assertIn("status", j.loads(row), f"a metrics row is missing its status: {row}")
+
+
 if __name__ == "__main__":
+
+
     unittest.main(verbosity=2)

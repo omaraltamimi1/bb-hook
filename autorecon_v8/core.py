@@ -273,12 +273,6 @@ WEB_INTEL_BODY_LIMIT = 1_000_000
 # and any host without the vboxsf share attached all want the same guarantee without editing code.
 KALI_SHARE_MOUNT = os.environ.get("AUTORECON_KALI_SHARE") or "/mnt/KaliShare"
 KALI_SHARE_SUBDIR = "autorecon-results"
-# Paths worth a human glance in a result file. Deliberately narrow: a result.txt that lists
-# everything is the same as one that lists nothing.
-HIGH_VALUE_URL_RE = re.compile(
-    r"(\.git/HEAD|\.env|wp-config\.php|/admin/?|/phpmyadmin|/_cat/|/actuator|/__debug__"
-    r"|/graphql|/graphiql|/openapi|/swagger|/api/|/v\d+/|/internal|/private|/backup)",
-    re.IGNORECASE)
 SECURITY_HEADERS = ("content-security-policy", "strict-transport-security", "x-frame-options",
                     "x-content-type-options", "referrer-policy", "permissions-policy",
                     "access-control-allow-origin", "access-control-allow-credentials")
@@ -1741,9 +1735,23 @@ class Runner:
             else: st.status="completed"; st.failure_reason="arjun reported no parameters on any target"
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=limit_values([o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)],self.args.max_hosts); st.total=len(origins); st.inputs=origins
+        if not origins:
+            st.status="skipped"; st.failure_reason="no live HTTP origins from httpx"
+            st.outputs=[str(self.raw/st.id/"metrics.jsonl")]; self.write_lines(self.raw/st.id/"normalized.txt",[])
+            self.write_lines(self.raw/st.id/"metrics.jsonl",[]); return
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
         probes=[("openapi","/openapi.json"),("swagger","/swagger.json"),("graphql","/graphql"),("scim-users","/scim/v2/Users?count=1"),("scim-groups","/scim/v2/Groups?count=1"),("oidc","/.well-known/openid-configuration"),("keycloak","/realms/master/.well-known/openid-configuration")]
         lock=threading.Lock(); results=[]
+        # Streamed per origin, appended and flushed, rather than collected in memory and written once
+        # at stage end. A killed, expired or SIGINT-ed api-discovery used to leave no metrics.jsonl at
+        # all, so [API ENDPOINTS] vanished from result.txt even though hundreds of probes had
+        # completed. A partial file showing what was actually probed is worth more than a
+        # complete-looking one that says nothing ran.
+        metrics_path=self.raw/st.id/"metrics.jsonl"; metrics_path.parent.mkdir(parents=True,exist_ok=True)
+        metrics_open=open(metrics_path,"a",encoding="utf-8"); st.outputs=[str(metrics_path)]
+        def emit(rows:list[dict[str,Any]])->None:
+            with lock: metrics_open.write("".join(json.dumps(r)+"\n" for r in rows))
+            metrics_open.flush(); os.fsync(metrics_open.fileno())
         def one(idx:int,o:str)->None:
             local=[]
             for name,path in probes:
@@ -1759,12 +1767,15 @@ class Runner:
                     local.append({"origin":o,"probe":name,"url":urljoin(o,path),"status":resp.status,"bytes":len(data),"body":str(p),"timestamp":now()})
                 except (OSError,http.client.HTTPException) as e: local.append({"origin":o,"probe":name,"error":str(e),"timestamp":now()})
                 finally: conn.close()
-            with lock: results.extend(local); st.processed+=1; self.save(); print(f"[api-discovery] {st.processed}/{st.total} {o} | elapsed={fmt_ms(time.monotonic()-(deadline-self.args.stage_timeout))} | ETA={eta(st.processed,st.total,st.runtime_seconds)}",flush=True)
+            with lock: results.extend(local)
+            emit(local)
+            with lock: st.processed+=1
+            self.save(); print(f"[api-discovery] {st.processed}/{st.total} {o} | elapsed={fmt_ms(time.monotonic()-(deadline-self.args.stage_timeout))} | ETA={eta(st.processed,st.total,st.runtime_seconds)}",flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.args.concurrency) as ex:
             futures=[]
             for i,o in enumerate(origins): self.check(deadline); futures.append(ex.submit(one,i,o))
             for f in futures: self.check(deadline); f.result(timeout=future_timeout(deadline,self.args.tool_timeout))
-        out=self.raw/st.id/"metrics.jsonl"; out.write_text("".join(json.dumps(x)+"\n" for x in results)); st.outputs=[str(out)]
+        metrics_open.close()
     def write_result_txt(self,status:str,resume:str,stages:list[dict[str,Any]])->Path|None:
         """
         One clean human-readable result.txt: the file a human reads to decide what to chase.
@@ -1783,7 +1794,12 @@ class Runner:
         subdomains=sorted(set(read_stage("subdomains")+read_stage("dnsx")))
         live=read_stage("httpx")
         ports=read_stage("ports")
-        interesting=[u for u in self.read("corpus") if HIGH_VALUE_URL_RE.search(u)]
+        # hunt_queue(), not a fresh regex over corpus: the queue is the ranked, deduped, capped view
+        # of every stage that can produce a candidate, and it already reads api-discovery's
+        # metrics.jsonl. Reading corpus with a local pattern saw only what crawl and archives
+        # produced, so an api-discovery run - including every probe of an interrupted one - had no
+        # representation in result.txt at all, even with real 200s sitting in metrics.jsonl.
+        interesting=[row["value"] for row in self.hunt_queue()]
 
         # The money sections. These are candidates produced by the stages added after the
         # original result.txt design, and they are what a bounty run is actually read for.
