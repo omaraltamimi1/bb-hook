@@ -78,6 +78,7 @@ def load_tests(loader,tests,pattern):
  import tests.no_silent_zeros as no_silent_zeros
  import tests.preflight as preflight
  import tests.profiles as profiles
+ import tests.secrets as secrets
  tests.addTests(loader.loadTestsFromModule(stage_coverage))
  tests.addTests(loader.loadTestsFromModule(access_matrix))
  tests.addTests(loader.loadTestsFromModule(web_intelligence))
@@ -89,6 +90,7 @@ def load_tests(loader,tests,pattern):
  tests.addTests(loader.loadTestsFromModule(no_silent_zeros))
  tests.addTests(loader.loadTestsFromModule(preflight))
  tests.addTests(loader.loadTestsFromModule(profiles))
+ tests.addTests(loader.loadTestsFromModule(secrets))
  return tests
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -763,6 +763,49 @@ HUNT_SENSITIVE=re.compile(r"(?:\.env|wp-config\.php|wp-login|/phpmyadmin|/admin(
 # on this list that can represent cross-account data exposure.
 HUNT_RANK={"access-candidate":0,"sensitive-path":1,"unusual-port":1,"discovered-endpoint":2,"discovered-path":2,"live-host":3,"open-port":4,"javascript":5}
 
+SECRET_HEADERS=("cookie","authorization","proxy-authorization","x-api-key","x-auth-token",
+                "x-session-token","x-amz-security-token","x-goog-api-key")
+
+def redact_argv(cmd:list[str])->list[str]:
+    """Strip credential values out of a recorded argv, keeping the shape.
+
+    commands.jsonl is a faithful record of what ran, and an argv carrying -H "Cookie: ..." is one of
+    the most useful lines in it - right up until someone zips the run directory into a report. The
+    header name and the flag survive so the command is still reproducible by hand; only the value goes.
+
+    Matched on the header name rather than on the value's shape. A redactor that recognises cookies
+    passes its own test and then writes the next credential header it has never seen straight into an
+    artifact, so the name is what is matched and anything following a recognized header flag is
+    dropped.
+    """
+    out:list[str]=[]
+    redact_next=False
+    for arg in cmd:
+        if redact_next:
+            out.append("<redacted>"); redact_next=False; continue
+        if arg in ("-H","--header","-b","--cookie","--headers","--cookie-file","-H;"):
+            out.append(arg); redact_next=True; continue
+        if ":" in arg:
+            name,_,value=arg.partition(":")
+            if name.strip().lower() in SECRET_HEADERS and value:
+                out.append(f"{name}: <redacted>"); continue
+        out.append(arg)
+    return out
+
+def credential_fingerprint(headers:dict[str,str])->str:
+    """A short, stable id for a set of credentials. The input is hashed, never stored or printed."""
+    if not headers: return ""
+    blob="|".join(f"{k.lower()}={v}" for k,v in sorted(headers.items()))
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+def auth_fingerprint(headers:dict[str,str])->dict[str,Any]:
+    """Which credential material is present, and what kind. Values never leave this function."""
+    if not headers: return {"present":False}
+    kinds=sorted(k for k in headers if k.lower() in
+                 ("cookie","authorization","proxy-authorization","x-api-key"))
+    return {"present":True,"credential_id":credential_fingerprint(headers),
+            "header_kinds":kinds,"header_count":len(headers)}
+
 def host_of(v:str)->str:
     return (urlsplit(v if "://" in v else "//"+v).hostname or "").lower()
 
@@ -876,6 +919,14 @@ class Runner:
         self.identities={"anon":{},"a":{},"b":{}}
         if getattr(args,"cookie_file",None): self.identities["a"]=load_credentials(args.cookie_file)
         if getattr(args,"cookie_file_b",None): self.identities["b"]=load_credentials(args.cookie_file_b)
+        # Presence and shape only, never values. An artifact that hides the session also hides that
+        # there was one, so a report built from an authenticated run reads exactly like one built
+        # anonymously - which is precisely the confusion an access-check candidate creates.
+        self.auth_state={"a":auth_fingerprint(self.identities["a"]),
+                         "b":auth_fingerprint(self.identities["b"]),
+                         "identities_distinct":bool(self.identities["a"] and self.identities["b"]
+                                and credential_fingerprint(self.identities["a"])
+                                !=credential_fingerprint(self.identities["b"]))}
         self.started=time.monotonic(); self.started_at=now(); self.global_deadline=self.started+args.global_timeout if args.global_timeout else float("inf")
         self.out=Path(args.output_dir).resolve(); self.out.mkdir(parents=True,exist_ok=True); os.chmod(self.out,0o700)
         self.run_id=args.resume if args.resume not in (None,"last") else (self._last_id() if args.resume=="last" else dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")+"-"+hashlib.sha256(self.seed.encode()).hexdigest()[:8])
@@ -929,7 +980,7 @@ class Runner:
             try: os.killpg(p.pid,signal.SIGKILL)
             except ProcessLookupError: pass
     def command(self,stage:str,cmd:list[str],target:str,deadline:float,output:Path,cwd:Path|None=None)->int:
-        rec={"timestamp":now(),"stage":stage,"command":cmd,"target":target,"dry_run":self.args.dry_run}
+        rec={"timestamp":now(),"stage":stage,"command":redact_argv(list(cmd)),"target":target,"dry_run":self.args.dry_run}
         with self.command_log.open("a") as f:f.write(json.dumps(rec)+"\n")
         if self.args.dry_run: print("[dry-run]",subprocess.list2cmdline(cmd)); return 0
         err=self.raw/stage/(output.name+".stderr"); err.parent.mkdir(parents=True,exist_ok=True); output.parent.mkdir(parents=True,exist_ok=True)
@@ -1853,7 +1904,17 @@ class Runner:
             reason=f"  ({row['failure_reason']})" if row["failure_reason"] else ""
             stage_rows.append(f"  {row['id']:<20} {row['status']:<14} {items:>6} items   {runtime}{reason}")
 
+        auth=getattr(self,"auth_state",{})
+        who=[]
+        if auth.get("a",{}).get("present"): who.append(f"identity A ({auth['a']['credential_id']})")
+        if auth.get("b",{}).get("present"): who.append(f"identity B ({auth['b']['credential_id']})")
+        auth_line=("authenticated: "+", ".join(who)) if who else "authenticated: no (anonymous run)"
+        if who and auth.get("identities_distinct") is False:
+            auth_line+=" -- WARNING: both identities carry the SAME credentials, so a cross-account difference is unprovable"
+        elif auth.get("identities_distinct"):
+            auth_line+=" -- two distinct identities"
         out=[sep,f"  AutoRecon v{__version__} -- {self.seed}",f"  Run    : {self.run_id}",
+             f"  Auth   : {auth_line}",
              f"  Status : {status}",f"  Started: {self.started_at}",sep]
         out+=section("DNS RECORDS",[f"  {x}" for x in dns])
         out+=section("SUBDOMAINS",[f"  {x}" for x in subdomains])
@@ -2008,7 +2069,7 @@ class Runner:
     def generate_reports(self,rc:int)->None:
         self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=self.resume_command()
         hunt=self.hunt_queue()
-        report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"hunt_queue":hunt,"vulnerability_claims":[],"stages":stages}
+        report={"version":"8.0.0","auth_state":getattr(self,"auth_state",{}),"run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"hunt_queue":hunt,"vulnerability_claims":[],"stages":stages}
         atomic_json(self.work/"report.json",report)
         with (self.work/"stages.csv").open("w",newline="") as f:
             w=csv.writer(f); w.writerow(["stage","status","processed","total","runtime_seconds","exit_code","reason"]); w.writerows([[s["id"],s["status"],s["processed"],s["total"],s["runtime_seconds"],s["exit_code"],s["failure_reason"]] for s in stages])
