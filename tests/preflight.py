@@ -171,5 +171,112 @@ class TestPreflightNeverBlocks(unittest.TestCase):
             s.rmtree(tmp, ignore_errors=True)
 
 
+class TestResumeRefusesToInventARun(unittest.TestCase):
+    """A mistyped --resume used to create the run directory and carry on.
+
+    It produced a clean result.txt for a run that never happened, wearing the id of a run the
+    operator believed they were continuing. The id is the one thing tying a report to its evidence,
+    so an unverified id must not be accepted silently.
+    """
+
+    def test_an_unknown_run_id_is_refused_and_creates_nothing(self):
+        import tempfile
+        import shutil
+        from autorecon_v8.core import Runner
+        from autorecon_v8.cli import apply_profile_defaults, parser
+        tmp = tempfile.mkdtemp()
+        try:
+            args = apply_profile_defaults(parser().parse_args(
+                ["127.0.0.1", "--output-dir", tmp, "--dry-run", "--resume", "nosuchrun"]))
+            with self.assertRaises(ValueError) as caught:
+                Runner(args)
+            self.assertIn("nosuchrun", str(caught.exception))
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), [],
+                             "a refused --resume left a directory behind")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_the_refusal_names_the_runs_that_do_exist(self):
+        import tempfile
+        import shutil
+        from autorecon_v8.core import Runner
+        from autorecon_v8.cli import apply_profile_defaults, parser
+        tmp = tempfile.mkdtemp()
+        try:
+            args = apply_profile_defaults(parser().parse_args(
+                ["127.0.0.1", "--output-dir", tmp, "--dry-run"]))
+            Runner(args).run()
+            args = apply_profile_defaults(parser().parse_args(
+                ["127.0.0.1", "--output-dir", tmp, "--dry-run", "--resume", "typo"]))
+            with self.assertRaises(ValueError) as caught:
+                Runner(args)
+            self.assertIn("known runs", str(caught.exception),
+                          "the refusal does not tell the operator what they could have typed")
+            self.assertIn(Path(tmp, "last").read_text().strip(), str(caught.exception))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_real_run_id_is_still_accepted(self):
+        import tempfile
+        import shutil
+        from autorecon_v8.core import Runner
+        from autorecon_v8.cli import apply_profile_defaults, parser
+        tmp = tempfile.mkdtemp()
+        try:
+            args = apply_profile_defaults(parser().parse_args(
+                ["127.0.0.1", "--output-dir", tmp, "--dry-run"]))
+            first = Runner(args)
+            first.run()
+            rid = first.run_id
+            args = apply_profile_defaults(parser().parse_args(
+                ["127.0.0.1", "--output-dir", tmp, "--dry-run", "--resume", rid]))
+            self.assertEqual(Runner(args).run_id, rid, "a genuine run id was refused")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_last_on_an_empty_output_dir_says_so(self):
+        """--resume last with nothing to resume is an error, and it is a loud one.
+
+        It already was, and stays that way: inventing a run is exactly what this change is about.
+        """
+        import tempfile
+        import shutil
+        from autorecon_v8.core import Runner
+        from autorecon_v8.cli import apply_profile_defaults, parser
+        tmp = tempfile.mkdtemp()
+        try:
+            args = apply_profile_defaults(parser().parse_args(
+                ["127.0.0.1", "--output-dir", tmp, "--dry-run", "--resume", "last"]))
+            with self.assertRaises(ValueError) as caught:
+                Runner(args)
+            self.assertIn("resumable", str(caught.exception))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+    def test_a_bare_directory_is_not_a_run(self):
+        """Existing is not the same as being a run.
+
+        A directory with the right name but no run-state.json is not something to continue: there is
+        no state to reuse and no evidence behind it. Accepting it would produce a result.txt for a run
+        that has no record of having done anything.
+        """
+        import tempfile
+        import shutil
+        from autorecon_v8.core import Runner
+        from autorecon_v8.cli import apply_profile_defaults, parser
+        tmp = tempfile.mkdtemp()
+        try:
+            Path(tmp, "20200101T000000Z-deadbeef").mkdir()
+            args = apply_profile_defaults(parser().parse_args(
+                ["127.0.0.1", "--output-dir", tmp, "--dry-run",
+                 "--resume", "20200101T000000Z-deadbeef"]))
+            with self.assertRaises(ValueError) as caught:
+                Runner(args)
+            self.assertIn("run-state.json", str(caught.exception))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
