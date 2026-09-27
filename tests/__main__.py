@@ -21,7 +21,7 @@ class Unit(unittest.TestCase):
  def test_selection(self):
   s,r=select_stages(self.ns(only=['dns,httpx']));self.assertEqual(s,{'dns','httpx','report'});self.assertIn('not selected',r['tls'])
   s,_=select_stages(self.ns(from_stage='crawl',until='corpus'));self.assertEqual(s,{'crawl','archives','corpus'})
-  s,r=select_stages(self.ns(skip=['nmap']));self.assertNotIn('nmap',s);self.assertEqual(r['nmap'],'explicitly skipped')
+  s,r=select_stages(self.ns(skip=['nmap']));self.assertNotIn('nmap',s);self.assertIn('retired',r['nmap']);self.assertIn('ports',r['nmap']);self.assertRaises(ValueError,select_stages,self.ns(skip=['definitely-not-a-stage']))
 
 class Integration(unittest.TestCase):
  def run_cli(self,*args,timeout=10,env=None):return subprocess.run([sys.executable,'-m','autorecon_v8',*args],text=True,capture_output=True,timeout=timeout,env=env)

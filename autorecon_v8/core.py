@@ -23,23 +23,26 @@ from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 STATUSES = {"pending", "running", "completed", "partial", "failed", "skipped", "interrupted", "unimplemented"}
-STAGE_IDS = ["dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports", "crawl", "archives", "corpus", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks", "report"]
-ACTIVE = {"screenshots", "ports", "crawl", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks"}
+STAGE_IDS = ["dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports", "crawl", "archives", "corpus", "javascript", "api-discovery", "web-intelligence", "arjun", "ffuf", "access-checks", "report"]
+ACTIVE = {"screenshots", "ports", "crawl", "javascript", "api-discovery", "web-intelligence", "arjun", "ffuf", "access-checks"}
 DESCRIPTIONS = {
  "dns":"Collect DNS records", "subdomains":"Enumerate passive subdomains", "dnsx":"Resolve discovered names", "tls":"Collect TLS metadata", "httpx":"Identify HTTP origins", "screenshots":"Capture visual evidence", "ports":"Discover ports", "crawl":"Crawl live applications", "archives":"Collect archived URLs", "corpus":"Normalize and deduplicate URLs", "javascript":"Preserve and inspect JavaScript", "api-discovery":"Read-only API and identity probes", "web-intelligence":"Collect web metadata", "arjun":"Discover parameters", "nmap":"Validate exposed services", "ffuf":"Discover content", "access-checks":"Read-only access differentials", "report":"Publish reports"}
 DEPS = {s: ([STAGE_IDS[i-1]] if i else []) for i,s in enumerate(STAGE_IDS)}
-DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"nmap":["ports"],"ffuf":["corpus"],"access-checks":["corpus"],"report":[]})
+DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"ffuf":["corpus"],"access-checks":["corpus"],"report":[]})
 # Stages with a real implementation: a cmds entry in generic_stage, a method dispatched from
 # execute(), or report generation. Every other stage is routed out of the generic fallback and
 # reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
 # added stage cannot escape classification.
+# Stage removed from the graph but still named by artifacts written by older runs. Keeping the
+# tombstone means a resume of such a run reports it as retired instead of raising KeyError.
+DEPRECATED_STAGES = {"nmap": "folded into the ports stage; run it with --port-services"}
 STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "arjun", "ffuf", "access-checks", "report"}
 UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
 assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
 
 PROFILES: dict[str,dict[str,Any]] = {
  "passive":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":500,"skip":sorted(ACTIVE)},
- "fast":{"concurrency":8,"rate_limit":20.0,"request_timeout":8.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":200,"skip":["screenshots","nmap","ffuf"]},
+ "fast":{"concurrency":8,"rate_limit":20.0,"request_timeout":8.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":200,"skip":["screenshots","ffuf"]},
  "balanced":{"concurrency":10,"rate_limit":15.0,"request_timeout":12.0,"tool_timeout":900.0,"stage_timeout":1800.0,"max_hosts":1000,"skip":[]},
  "deep":{"concurrency":20,"rate_limit":10.0,"request_timeout":20.0,"tool_timeout":1800.0,"stage_timeout":7200.0,"max_hosts":5000,"skip":[]},
  "custom":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":600.0,"stage_timeout":1200.0,"max_hosts":500,"skip":[]},
@@ -321,6 +324,73 @@ def ffuf_wordlist(preferred: str | None = None) -> str | None:
     return None
 
 
+def naabu_open_ports(payload: str) -> dict[str, list[int]]:
+    """
+    Parse naabu's -list output into {host: [port, ...]}.
+
+    naabu prints one "host:port" per line and nothing else on this path, so a line that is not
+    a host and a numeric port is skipped rather than coerced into a bogus target.
+    """
+    out: dict[str, list[int]] = {}
+    for line in (payload or "").splitlines():
+        token = line.strip()
+        if not token or ":" not in token:
+            continue
+        host, _, port = token.rpartition(":")
+        host = host.strip().strip("[]")
+        if not host or not port.isdigit():
+            continue
+        number = int(port)
+        if not 1 <= number <= 65535:
+            continue
+        out.setdefault(host, [])
+        if number not in out[host]:
+            out[host].append(number)
+    return out
+
+
+def nmap_services(payload: str) -> list[dict[str, Any]]:
+    """
+    Parse nmap -oX XML into per-port service records.
+
+    XML is requested rather than the human-readable table because the table format is not
+    stable across nmap builds, and a banner is only useful here if the port it came from is
+    unambiguous.
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(payload or "")
+    except ET.ParseError:
+        return []
+    out: list[dict[str, Any]] = []
+    for host in root.iter("host"):
+        address = host.find("./address")
+        ip = address.get("addr") if address is not None else None
+        if not ip:
+            continue
+        for port_el in host.iter("port"):
+            state_el = port_el.find("state")
+            state = state_el.get("state") if state_el is not None else None
+            if state != "open":
+                continue
+            number = port_el.get("portid")
+            if not number or not number.isdigit():
+                continue
+            service_el = port_el.find("service")
+            banner_el = port_el.find("./script/output")
+            out.append({
+                "host": ip,
+                "port": int(number),
+                "protocol": port_el.get("protocol") or "tcp",
+                "service": service_el.get("name") if service_el is not None else None,
+                "product": service_el.get("product") if service_el is not None else None,
+                "version": service_el.get("version") if service_el is not None else None,
+                "extrainfo": service_el.get("extrainfo") if service_el is not None else None,
+                "banner": (banner_el.text or "").strip() if banner_el is not None else None,
+            })
+    return out
+
+
 def ffuf_results(payload: str) -> list[dict[str, Any]]:
     """
     Parse ffuf's -of json into result records.
@@ -577,6 +647,7 @@ class Runner:
             elif st.id=="crawl": self.crawl_stage(st,deadline)
             elif st.id=="access-checks": self.access_checks_stage(st,deadline)
             elif st.id=="arjun": self.arjun_stage(st,deadline)
+            elif st.id=="ports": self.ports_stage(st,deadline)
             elif st.id=="ffuf": self.ffuf_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
@@ -591,7 +662,7 @@ class Runner:
         discovered=self.read("subdomains")
         resolved=self.read("dnsx")
         hosts=resolved or discovered or [self.host]
-        mapping={"dnsx":discovered+[self.host],"tls":hosts,"httpx":hosts,"screenshots":self.read("httpx"),"ports":hosts,"crawl":self.read("httpx"),"archives":discovered+[self.host],"corpus":self.read("crawl")+self.read("archives"),"javascript":self.read("corpus"),"api-discovery":self.read("httpx") or [self.seed],"web-intelligence":self.read("httpx"),"arjun":self.read("corpus"),"nmap":self.read("ports"),"ffuf":self.read("httpx"),"access-checks":self.read("corpus")}
+        mapping={"dnsx":discovered+[self.host],"tls":hosts,"httpx":hosts,"screenshots":self.read("httpx"),"ports":hosts,"crawl":self.read("httpx"),"archives":discovered+[self.host],"corpus":self.read("crawl")+self.read("archives"),"javascript":self.read("corpus"),"api-discovery":self.read("httpx") or [self.seed],"web-intelligence":self.read("httpx"),"arjun":self.read("corpus"),"ffuf":self.read("httpx"),"access-checks":self.read("corpus")}
         values=[]
         for value in mapping.get(sid,[self.host]):
             if value and value not in values and self.scope.decide(value)[0]: values.append(value)
@@ -605,14 +676,14 @@ class Runner:
             self.write_lines(dest,values)
             print(f"[{st.id}] unimplemented: no runner for this stage, {len(values)} candidate(s) listed for manual follow-up",flush=True)
             return
-        tool={"dns":"dig","subdomains":"subfinder","dnsx":"dnsx","tls":"tlsx","httpx":"httpx","screenshots":"httpx","ports":"naabu","crawl":"katana","archives":"gau","javascript":"curl","web-intelligence":"curl","arjun":"arjun","nmap":"nmap","ffuf":"ffuf","access-checks":"curl"}.get(st.id)
+        tool={"dns":"dig","subdomains":"subfinder","dnsx":"dnsx","tls":"tlsx","httpx":"httpx","screenshots":"httpx","ports":"naabu","crawl":"katana","archives":"gau","javascript":"curl","web-intelligence":"curl","arjun":"arjun","ffuf":"ffuf","access-checks":"curl"}.get(st.id)
         if not values: st.status="skipped"; st.failure_reason="empty input"; return
         if tool and not shutil.which(tool): st.status="skipped"; st.failure_reason=f"missing external tool: {tool}"; return
         if self.args.dry_run: self.write_lines(dest,values); st.processed=st.total; return
         # Safe bounded adapters; raw stdout remains separate from normalized evidence.
         input_file=self.raw/st.id/"inputs.txt"
         self.write_lines(input_file,values)
-        cmds={"dns":[tool,"+short",self.host],"subdomains":[tool,"-silent","-d",self.host],"dnsx":[tool,"-silent","-l",str(input_file)],"tls":[tool,"-silent","-l",str(input_file)],"httpx":[tool,"-silent","-l",str(input_file)],"ports":[tool,"-silent","-list",str(input_file)],"archives":[tool,"--subs",self.host]}
+        cmds={"dns":[tool,"+short",self.host],"subdomains":[tool,"-silent","-d",self.host],"dnsx":[tool,"-silent","-l",str(input_file)],"tls":[tool,"-silent","-l",str(input_file)],"httpx":[tool,"-silent","-l",str(input_file)],"archives":[tool,"--subs",self.host]}
         if st.id in cmds:
             raw=self.raw/st.id/"stdout.txt"; rc=self.command(st.id,[str(x) for x in cmds[st.id]],values[0],deadline,raw); st.exit_code=rc
             lines=raw.read_text(errors="replace").splitlines() if raw.exists() else []
@@ -874,6 +945,54 @@ class Runner:
         print(f"[access-checks] {st.processed}/{len(targets)} target(s) probed across {len(states_available)} state(s): {len(real)} candidate(s), {len(suppressed)} suppressed, {len(set(refused))} refused out-of-scope",flush=True)
         if refused: st.failure_reason=f"{len(set(refused))} out-of-scope target(s) or callback(s) refused"
         if not real: st.status="completed"
+    def ports_stage(self,st:StageState,deadline:float)->None:
+        hosts=self.inputs(st.id); st.total=len(hosts); st.inputs=[str(x) for x in hosts]
+        root=self.raw/st.id; dest=root/"normalized.txt"; st.outputs=[str(dest)]
+        if not hosts:
+            st.status="skipped"; st.failure_reason="empty input"; self.write_lines(dest,[]); return
+        naabu=shutil.which("naabu")
+        if not naabu:
+            st.status="skipped"; st.failure_reason="missing external tool: naabu"; self.write_lines(dest,[]); return
+        if self.args.dry_run: self.write_lines(dest,hosts); st.processed=st.total; return
+        root.mkdir(parents=True,exist_ok=True)
+        input_file=root/"inputs.txt"; self.write_lines(input_file,hosts)
+        raw=root/"stdout.txt"
+        rc=self.command(st.id,[naabu,"-silent","-list",str(input_file)],hosts[0],deadline,raw); st.exit_code=rc
+        opened=naabu_open_ports(raw.read_text(errors="replace") if raw.exists() else "")
+        self.write_lines(dest,[f"{h}:{p}" for h,ports in opened.items() for p in ports])
+        st.processed=st.total
+        if rc and not opened:
+            st.status="failed"; st.failure_reason=f"naabu exited {rc} and reported no open ports"; return
+        if not getattr(self.args,"port_services",False):
+            return
+        if not opened:
+            st.status="partial"; st.failure_reason="service detection requested but naabu confirmed no open port to scan"; return
+        nmap=shutil.which("nmap")
+        if not nmap:
+            st.status="partial"; st.failure_reason="service detection requested but missing external tool: nmap"; return
+        services=[]; refused=[]
+        for host,ports in opened.items():
+            self.check(deadline)
+            if time.monotonic()>=deadline:
+                st.status="partial"; st.failure_reason="stage deadline reached before every host was fingerprinted"; break
+            if not self.scope.decide(host if "://" in host else f"http://{host}")[0]:
+                refused.append(host); continue
+            xml_out=root/(re.sub(r"[^A-Za-z0-9]+","_",host)+".nmap.xml")
+            # -p is passed the exact ports naabu already confirmed, so nmap cannot widen the scan
+            # on its own; -Pn skips host discovery because naabu proved the host is up; -T4 is the
+            # fastest sane template; -sV/-sC are what the opt-in is for.
+            cmd=[nmap,"-sV","-sC","-Pn","-T4","-p",",".join(str(x) for x in ports),"-oX",str(xml_out),host]
+            rc2=self.command(f"{st.id}-services",cmd,host,deadline,root/"services-stdout.txt")
+            if rc2: st.exit_code=rc2
+            services.extend(nmap_services(xml_out.read_text(errors="replace") if xml_out.exists() else ""))
+        if refused: self.write_lines(root/"refused.txt",refused)
+        atomic_json(root/"services.json",{"generated_at":now(),"run_id":self.run_id,
+            "nmap_flags":"-sV -sC -Pn -T4","scan_scope":"ports confirmed open by naabu only",
+            "hosts_fingerprinted":len(opened)-len(refused),"hosts_refused":refused,"services":services,
+            "disclaimer":"service and version banners are fingerprinting data, not vulnerabilities. A banner exposes software and version; a finding requires a demonstrated weakness in that version."})
+        self.write_lines(root/"services.tsv",[f"{r['host']}\t{r['port']}\t{r['protocol']}\t{r['service']}\t{r['product']}\t{r['version']}" for r in services])
+        st.outputs.append(str(root/"services.json"))
+        print(f"[{st.id}] naabu: {len(opened)} host(s) with open ports; services: {len(services)} port record(s)",flush=True)
     def ffuf_stage(self,st:StageState,deadline:float)->None:
         origins=[u for u in self.read_partition("origins.txt") if u.lower().startswith(("http://","https://"))]
         seen=set(); hosts=[u for u in origins if not (u in seen or seen.add(u))]
@@ -1051,11 +1170,17 @@ def select_stages(args:argparse.Namespace)->tuple[set[str],dict[str,str]]:
     selected=set(STAGE_IDS); reasons={}
     only=csvset(args.only); skip=csvset(args.skip)|set(PROFILES[args.profile]["skip"])
     unknown=(only|skip|({args.restart_stage} if args.restart_stage else set()))-set(STAGE_IDS)
+    # A name that used to be a stage is not an error: scripts and saved resumes still name it.
+    # Report it as retired so the operator is told where the work went instead of hitting a
+    # bare "unknown stage" that gives no clue.
+    retired=sorted(unknown&set(DEPRECATED_STAGES))
+    unknown-=set(DEPRECATED_STAGES)
     if unknown: raise ValueError("unknown stage(s): "+",".join(sorted(unknown)))
+    for s in retired: reasons[s]=f"retired: {DEPRECATED_STAGES[s]}"
     if only: selected=only|{"report"}; reasons.update({s:"not selected by --only" for s in set(STAGE_IDS)-selected})
     if args.from_stage: selected-={s for s in STAGE_IDS[:STAGE_IDS.index(args.from_stage)]}; reasons.update({s:f"before --from {args.from_stage}" for s in set(STAGE_IDS)-selected})
     if args.until: selected-={s for s in STAGE_IDS[STAGE_IDS.index(args.until)+1:]}; reasons.update({s:f"after --until {args.until}" for s in set(STAGE_IDS)-selected})
-    for s in skip: selected.discard(s); reasons[s]="explicitly skipped" if s in csvset(args.skip) else f"disabled by {args.profile} profile"
+    for s in skip: selected.discard(s); reasons.setdefault(s,"explicitly skipped" if s in csvset(args.skip) else f"disabled by {args.profile} profile")
     if args.passive:
         for s in ACTIVE:selected.discard(s);reasons[s]="disabled by --passive"
     return selected,reasons
