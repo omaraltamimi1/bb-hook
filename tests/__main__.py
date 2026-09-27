@@ -74,6 +74,7 @@ def load_tests(loader,tests,pattern):
  import tests.dag_consistency as dag_consistency
  import tests.hunt_queue as hunt_queue
  import tests.end_to_end as end_to_end
+ import tests.ports as ports
  tests.addTests(loader.loadTestsFromModule(stage_coverage))
  tests.addTests(loader.loadTestsFromModule(access_matrix))
  tests.addTests(loader.loadTestsFromModule(web_intelligence))
@@ -81,6 +82,7 @@ def load_tests(loader,tests,pattern):
  tests.addTests(loader.loadTestsFromModule(dag_consistency))
  tests.addTests(loader.loadTestsFromModule(hunt_queue))
  tests.addTests(loader.loadTestsFromModule(end_to_end))
+ tests.addTests(loader.loadTestsFromModule(ports))
  return tests
 
 if __name__=='__main__':unittest.main(verbosity=2)
