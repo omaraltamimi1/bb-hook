@@ -754,6 +754,10 @@ def with_params(url: str, names: list[str]) -> str:
 # Ranking inputs for the hunt queue. The queue is a worklist, not a finding: every entry is a
 # candidate and the report says so. Ranking exists to put a human's next click in the right place.
 UNUSUAL_PORTS={21,22,23,25,110,143,445,1433,1521,2049,2375,3000,3306,3389,4369,5000,5432,5601,5672,5900,5984,6379,6443,8000,8008,8080,8081,8443,8888,9000,9200,11211,27017,28017}
+# Stages that send credentials to the target. Everything else is target-independent, so a credential
+# change does not invalidate it and re-running it would only cost time.
+AUTH_DEPENDENT_STAGES=frozenset({"api-discovery","access-checks","arjun","crawl","web-intelligence"})
+
 HUNT_LIMIT=80
 # result.txt is read by a person, not parsed. 40 keeps a large target's sections scannable; the
 # hunt queue in result.md is the exhaustive ranked list, so nothing is only available there.
@@ -954,6 +958,25 @@ class Runner:
         old=json.loads(self.state_path.read_text())
         if old.get("target")!=self.seed: raise ValueError("resume target does not match original target")
         for sid,val in old["stages"].items(): self.stages[sid]=StageState(**val)
+        # Resume invalidates by stage and by --restart-stage, but not by credential state. A resume
+        # with a different cookie jar reused the previous run's api-discovery results wholesale, so a
+        # report could mix yesterday's authenticated probes with today's anonymous ones and give no
+        # sign of it. Only the stages that actually sent credentials are reset; the rest are
+        # target-independent and re-running them would cost time for nothing.
+        was_id=((old.get("auth_state") or {}).get("a") or {}).get("credential_id")
+        now_id=self.auth_state["a"].get("credential_id")
+        self.credentials_changed=bool(now_id and was_id and now_id!=was_id)
+        self.credentials_invalidated: list[str]=[]
+        if self.credentials_changed:
+            for sid in AUTH_DEPENDENT_STAGES:
+                if sid in self.stages and self.stages[sid].status=="completed":
+                    self.stages[sid]=StageState(sid,sid,DESCRIPTIONS[sid],DEPS[sid],
+                                                resume="invalidated: credentials changed since the original run")
+                    self.credentials_invalidated.append(sid)
+            if self.credentials_invalidated:
+                print("autorecon: credentials changed since the original run; re-running "
+                      +", ".join(self.credentials_invalidated)
+                      +" so authenticated results are not mixed across identities",flush=True)
         for st in self.stages.values():
             if st.status in {"running","interrupted"}: st.status="pending"; st.resume="retrying interrupted unit"
         if self.args.restart_stage:
@@ -965,7 +988,7 @@ class Runner:
         self.stop.set()
         if self.child: self._terminate(self.child)
     def save(self)->None:
-        atomic_json(self.state_path,{"version":1,"run_id":self.run_id,"target":self.seed,"started_at":self.started_at,"updated_at":now(),"stages":{k:dataclasses.asdict(v) for k,v in self.stages.items()}})
+        atomic_json(self.state_path,{"version":1,"run_id":self.run_id,"target":self.seed,"auth_state":getattr(self,"auth_state",{}),"started_at":self.started_at,"updated_at":now(),"stages":{k:dataclasses.asdict(v) for k,v in self.stages.items()}})
     def log_scope(self,value:str)->bool:
         allowed,reason=self.scope.decide(value)
         with self.scope_log.open("a") as f: f.write(json.dumps({"timestamp":now(),"value":value,"allowed":allowed,"reason":reason})+"\n")
@@ -1057,7 +1080,7 @@ class Runner:
             elif st.id=="screenshots": self.screenshot_stage(st,deadline)
             elif st.id=="web-intelligence": self.web_intelligence_stage(st,deadline)
             else: self.generic_stage(st,deadline)
-            if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
+            if st.status=="running": st.status="completed"; st.exit_code=0; st.resume=("completed artifacts reusable"+(f"; {st.resume}" if (st.resume or "").startswith("invalidated") else ""))
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
         except Interrupted: st.status="interrupted"; st.exit_code=130; st.failure_reason="signal received"; st.resume="retry remaining units"; raise
         except Exception as e:
