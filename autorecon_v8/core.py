@@ -33,7 +33,7 @@ DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archive
 # execute(), or report generation. Every other stage is routed out of the generic fallback and
 # reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
 # added stage cannot escape classification.
-STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "api-discovery", "javascript", "report"}
+STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "report"}
 UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
 assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
 
@@ -151,6 +151,47 @@ def has_parameters(value: str) -> bool:
     return any(ID_SEGMENT_RE.match(segment) for segment in u.path.split("/") if segment)
 
 
+CRAWL_DEFAULT_DEPTH = 3
+CRAWL_NATIVE_MAX_URLS = 500
+CRAWL_JS_EXTS = (".js", ".mjs")
+LINK_ATTR_RE = re.compile(r"""(?:href|src|action)\s*=\s*["']([^"'<>\s]{2,2048})["']""", re.IGNORECASE)
+SKIP_SCHEMES = ("javascript:", "mailto:", "tel:", "data:", "#", "blob:")
+
+
+def extract_links(html: str, base: str) -> list[str]:
+    """Absolute, same-page link targets found in an HTML document, in document order."""
+    out: list[str] = []
+    for ref in LINK_ATTR_RE.findall(html or ""):
+        ref = ref.strip()
+        if not ref or ref.lower().startswith(SKIP_SCHEMES):
+            continue
+        try:
+            absolute = urljoin(base, ref)
+        except ValueError:
+            continue
+        try:
+            absolute = canonical_url(absolute)
+        except ValueError:
+            continue
+        if absolute and absolute not in out:
+            out.append(absolute)
+    return out
+
+
+def crawl_scope_pattern(hosts: Iterable[str]) -> str | None:
+    """
+    Build a katana -cs regex covering exactly the hosts in scope.
+
+    katana's default -fs rdn follows the whole root domain, which over-collects
+    when a program authorises one subdomain but not its siblings. Passing -cs
+    narrows the crawler to the hosts the run was actually scoped to.
+    """
+    alternatives = sorted({h.strip().lower().rstrip(".") for h in hosts if h and h.strip()})
+    if not alternatives:
+        return None
+    return "(" + "|".join(re.escape(h) for h in alternatives) + ")"
+
+
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True); fd,tmp=tempfile.mkstemp(prefix=".state-",dir=path.parent)
@@ -256,13 +297,13 @@ class Runner:
         except (ProcessLookupError,subprocess.TimeoutExpired):
             try: os.killpg(p.pid,signal.SIGKILL)
             except ProcessLookupError: pass
-    def command(self,stage:str,cmd:list[str],target:str,deadline:float,output:Path)->int:
+    def command(self,stage:str,cmd:list[str],target:str,deadline:float,output:Path,cwd:Path|None=None)->int:
         rec={"timestamp":now(),"stage":stage,"command":cmd,"target":target,"dry_run":self.args.dry_run}
         with self.command_log.open("a") as f:f.write(json.dumps(rec)+"\n")
         if self.args.dry_run: print("[dry-run]",subprocess.list2cmdline(cmd)); return 0
         err=self.raw/stage/(output.name+".stderr"); err.parent.mkdir(parents=True,exist_ok=True); output.parent.mkdir(parents=True,exist_ok=True)
         with output.open("a") as out,err.open("a") as ef:
-            p=subprocess.Popen(cmd,stdout=out,stderr=ef,text=True,start_new_session=True); self.child=p; start=time.monotonic(); next_beat=start
+            p=subprocess.Popen(cmd,stdout=out,stderr=ef,text=True,start_new_session=True,cwd=str(cwd) if cwd else None); self.child=p; start=time.monotonic(); next_beat=start
             try:
                 while p.poll() is None:
                     self.check(min(deadline,start+self.args.tool_timeout))
@@ -311,6 +352,7 @@ class Runner:
             elif st.id=="api-discovery": self.api_stage(st,deadline)
             elif st.id=="javascript": self.javascript_stage(st,deadline)
             elif st.id=="corpus": self.corpus_stage(st,deadline)
+            elif st.id=="crawl": self.crawl_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -450,6 +492,69 @@ class Runner:
         st.outputs=[str(p) for p in (dest,root/"javascript.txt",root/"api.txt",root/"params.txt",root/"plain.txt",root/"static.txt",root/"origins.txt",root/"classify.tsv")]
         st.processed=st.total
         print(f"[corpus] {len(signal)} canonical URL(s): {len(javascript)} js, {len(api)} api, {len(params)} parameterized, {len(plain)} plain, {len(static)} static excluded",flush=True)
+    def crawl_scope_pattern(self)->str|None:
+        hosts=[self.host]+[h for h in self.args.scope_include if h]
+        for line in self.read("dnsx")+self.read("httpx"):
+            host=urlsplit(line if "://" in line else "//"+line).hostname
+            if host: hosts.append(host)
+        return crawl_scope_pattern(hosts)
+    def crawl_native(self,seeds:list[str],deadline:float,cap:int)->list[str]:
+        """Bounded same-scope BFS used when katana is unavailable."""
+        found:set[str]=set(seeds); queue=[(s,0) for s in seeds]; ordered=list(seeds)
+        while queue and len(found)<cap:
+            url,depth=queue.pop(0)
+            if depth>=self.args.crawl_depth: continue
+            self.check(deadline)
+            status,body=self._http_get(url,deadline,limit=2_000_000)
+            if status!=200 or not body: continue
+            links=extract_links(body[:2_000_000].decode("utf-8","ignore"),url)
+            for link in links:
+                if not self.scope.decide(link)[0]: continue
+                if link in found: continue
+                found.add(link); ordered.append(link); queue.append((link,depth+1))
+                if len(found)>=cap: break
+        return ordered
+    def crawl_stage(self,st:StageState,deadline:float)->None:
+        seeds=[v for v in self.inputs(st.id) if v]
+        root=self.raw/st.id; dest=root/"normalized.txt"; st.total=len(seeds); st.inputs=seeds
+        if not seeds:
+            st.status="skipped"; st.failure_reason="no live HTTP origins from httpx"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+        if self.args.dry_run:
+            self.write_lines(dest,seeds); st.processed=st.total; st.outputs=[str(dest)]; return
+        root.mkdir(parents=True,exist_ok=True)
+        input_file=root/"inputs.txt"; self.write_lines(input_file,seeds)
+        tool=shutil.which("katana"); scope_pattern=self.crawl_scope_pattern()
+        if tool:
+            # katana has no -l flag: -u/-list takes targets, and also accepts a file path,
+            # which avoids ARG_MAX for large seed sets. -e cdn drops CDN hosts, -duc skips
+            # the update check, -nc disables ANSI colouring in the captured stdout.
+            cmd=[tool,"-silent","-u",str(input_file),"-d",str(max(1,self.args.crawl_depth)),
+                 "-c",str(max(1,self.args.concurrency)),"-rl",str(max(1,int(self.args.rate_limit))),
+                 "-timeout",str(max(1,int(self.args.request_timeout))),"-e","cdn","-duc","-nc"]
+            if scope_pattern: cmd+=["-cs",scope_pattern]
+            stdout=root/"katana.txt"
+            rc=self.command(st.id,cmd,self.host,deadline,stdout,cwd=root); st.exit_code=rc
+            engine="katana"
+            lines=stdout.read_text(errors="replace").splitlines() if stdout.exists() else []
+            discovered=[line.strip() for line in lines if line.strip().startswith(("http://","https://"))]
+        else:
+            engine="native"; rc=0
+            discovered=self.crawl_native(seeds,deadline,CRAWL_NATIVE_MAX_URLS)
+            st.failure_reason=None
+        # Scope.decide is the enforcement point. katana is told -cs as a first filter, but the
+        # crawler follows attacker-influenced links, so nothing it emits is trusted.
+        kept=[u for u in dict.fromkeys(discovered) if self.scope.decide(u)[0]]
+        dropped=len(discovered)-len(kept)
+        self.write_lines(dest,kept)
+        self.write_lines(root/"dropped-out-of-scope.txt",[u for u in dict.fromkeys(discovered) if u not in set(kept)])
+        st.outputs=[str(dest),str(root/"dropped-out-of-scope.txt")]+([str(root/"katana.txt")] if engine=="katana" else [])
+        st.processed=len(kept)
+        print(f"[crawl] {engine}: {len(kept)} in-scope URL(s) from {len(seeds)} seed(s), {dropped} dropped as out-of-scope",flush=True)
+        if engine=="native" and not tool:
+            st.failure_reason="katana not installed; used the bounded native crawler instead"
+        if rc and not kept:
+            st.status="failed"; st.failure_reason=f"{engine} exited {rc} and produced no in-scope URLs"
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
