@@ -14,13 +14,16 @@ The literal is distinctive on purpose. A test using a realistic-looking cookie v
 against a redaction that only matches a real cookie's shape.
 """
 import json
+import os
 import shutil
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from autorecon_v8.cli import apply_profile_defaults, parser
-from autorecon_v8.core import Runner
+from autorecon_v8.core import CookieJar, Runner, StageState
 
 # Distinctive, and not shaped like a real session value, so a shape-based redactor cannot pass this
 # by accident and a real one cannot be quietly narrowed to cookies.
@@ -232,6 +235,152 @@ class TestResumeCommandRoundTrips(unittest.TestCase):
         self.assertIn(str(jar), line, "the credential is referenced by path instead")
 
 
+class TestProgramHeaders(unittest.TestCase):
+    """A program that asks for an identity header on unauthenticated requests.
+
+    The HackerOne scope export for whatnot requires `X-HackerOne-Research: <username>` on requests
+    that cannot carry a test account's alias. The header has to reach the wire, not just the args.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+
+    def build(self, *headers):
+        return Runner(apply_profile_defaults(parser().parse_args(
+            ["127.0.0.1", "--output-dir", self.tmp, "--dry-run", *headers])))
+
+    def test_the_flag_is_repeatable(self):
+        run = self.build("--header", "X-HackerOne-Research: omaraltamimi", "--header", "X-Other: 2")
+        self.assertEqual(run.extra_headers,
+                         {"X-HackerOne-Research": "omaraltamimi", "X-Other": "2"})
+
+    def test_a_malformed_header_is_refused_rather_than_ignored(self):
+        for bad in ("no-colon-here", ":empty-name", "  :v"):
+            with self.assertRaises(ValueError, msg=f"{bad!r} was accepted"):
+                self.build("--header", bad)
+
+    def test_the_header_reaches_the_request(self):
+        """Driven against a real listener, because the bug class is "it parsed but never went out"."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.update({k: v for k, v in self.headers.items()})
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        run = self.build("--header", "X-HackerOne-Research: omaraltamimi")
+        run._http_get(f"http://127.0.0.1:{port}/", __import__("time").monotonic() + 30)
+        self.assertEqual(seen.get("X-HackerOne-Research"), "omaraltamimi",
+                         "the identity header never reached the request")
+
+    def test_a_value_containing_a_colon_is_kept_whole(self):
+        run = self.build("--header", "X-Trace: a:b:c")
+        self.assertEqual(run.extra_headers["X-Trace"], "a:b:c")
+
+
+class TestProgramHeadersOnEveryRequestPath(unittest.TestCase):
+    """The identity header has to go out on every path that touches the target, not just one.
+
+    Three request sites exist: the page fetcher, the access-check prober, and the api-discovery
+    probe. A header wired into only the first is a header that silently did not go out on the two
+    requests an access-check candidate actually depends on.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+        self.seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def _respond(self):
+                self.server.seen.append(dict(self.headers.items()))
+                body = b'{"openapi":"3.0.0"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = _respond
+
+            def do_POST(self):
+                self._respond()
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.seen = self.seen
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+        self.origin = f"http://127.0.0.1:{self.port}"
+
+    def build(self, dry_run=True):
+        # api_stage returns early under --dry-run without making a request, so the api-discovery
+        # path has to run for real against the local listener to observe anything.
+        argv = ["127.0.0.1", "--output-dir", self.tmp,
+                "--header", "X-HackerOne-Research: omaraltamimi"]
+        if dry_run:
+            argv.append("--dry-run")
+        run = Runner(apply_profile_defaults(parser().parse_args(argv)))
+        run.seed = self.origin
+        return run
+
+    def deadline(self):
+        import time
+        return time.monotonic() + 30
+
+    def test_the_page_fetcher_sends_it(self):
+        self.build()._http_get(self.origin, self.deadline())
+        self.assertEqual(self.seen[-1].get("X-HackerOne-Research"), "omaraltamimi")
+
+    def test_the_access_check_prober_sends_it(self):
+        run = self.build()
+        run._probe(self.origin, {"Cookie": "sessionid=x"}, self.deadline())
+        self.assertEqual(self.seen[-1].get("X-HackerOne-Research"), "omaraltamimi",
+                         "the access-check prober dropped the identity header")
+
+    def test_a_per_request_header_cannot_drop_the_identity_header(self):
+        """Program headers are applied first, so a caller-supplied header cannot displace one."""
+        run = self.build()
+        run._probe(self.origin, {"X-HackerOne-Research": "someone-else"}, self.deadline())
+        self.assertEqual(self.seen[-1].get("X-HackerOne-Research"), "omaraltamimi",
+                         "a per-request header displaced the program's identity header")
+
+    def test_the_api_discovery_probe_sends_it(self):
+        run = self.build(dry_run=False)
+        httpx = Path(run.raw) / "httpx" / "normalized.txt"
+        httpx.parent.mkdir(parents=True, exist_ok=True)
+        httpx.write_text(self.origin + "\n")
+        st = StageState(id="api-discovery", name="api-discovery", description="", dependencies=[])
+        run.stages = {"api-discovery": st}
+        run.execute(st)
+        self.assertTrue(self.seen, "api-discovery made no request, so nothing was checked")
+        for headers in self.seen:
+            self.assertEqual(headers.get("X-HackerOne-Research"), "omaraltamimi",
+                             "an api-discovery request went out without the identity header")
+
+
 if __name__ == "__main__":
+
+
 
     unittest.main(verbosity=2)
