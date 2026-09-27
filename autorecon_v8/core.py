@@ -693,6 +693,15 @@ def with_params(url: str, names: list[str]) -> str:
     return urlunsplit((u.scheme, u.netloc, u.path, urlencode(pairs), ""))
 
 
+# Ranking inputs for the hunt queue. The queue is a worklist, not a finding: every entry is a
+# candidate and the report says so. Ranking exists to put a human's next click in the right place.
+UNUSUAL_PORTS={21,22,23,25,110,143,445,1433,1521,2049,2375,3000,3306,3389,4369,5000,5432,5601,5672,5900,5984,6379,6443,8000,8008,8080,8081,8443,8888,9000,9200,11211,27017,28017}
+HUNT_LIMIT=80
+HUNT_SENSITIVE=re.compile(r"(?:\.env|wp-config\.php|wp-login|/phpmyadmin|/admin(?:/|$)|/_cat/|/actuator|/\.git/|/\.git$|/\.aws/|/\.ssh/|/server-status|/\.DS_Store|/config\.(?:json|ya?ml|ini)|/backup|/dump|/sql|/internal|/private|/\.svn/|/cgi-bin/)",re.IGNORECASE)
+# Lower sorts first. An authorization candidate outranks an open port because it is the only entry
+# on this list that can represent cross-account data exposure.
+HUNT_RANK={"access-candidate":0,"sensitive-path":1,"unusual-port":1,"discovered-endpoint":2,"discovered-path":2,"live-host":3,"open-port":4,"javascript":5}
+
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True); fd,tmp=tempfile.mkstemp(prefix=".state-",dir=path.parent)
@@ -1646,14 +1655,79 @@ class Runner:
             print(f"[report] shared evidence mount unavailable ({e}); result is in {run_txt}",flush=True)
         return run_txt
 
+    def hunt_queue(self,limit:int=HUNT_LIMIT)->list[dict[str,str]]:
+        """
+        One ranked, deduped, scope-checked worklist of everything worth a human's attention.
+
+        Sources are every stage that discovers something, not only the ones that existed when this
+        was first written: the authorization candidates, the paths ffuf matched, the endpoints
+        web-intelligence read out of a page, and the parameters arjun found. Ranking puts an access
+        candidate above an open port because it is the only entry here that can represent
+        cross-account data exposure.
+        """
+        items:list[dict[str,str]]=[]; seen:set[str]=set()
+        def add(value:str,why:str,stage:str)->None:
+            value=(value or "").strip()
+            if not value or value in seen: return
+            # Scope-checked again here as well as at the producer. A stage that already filtered
+            # is not assumed to have filtered completely.
+            if not self.scope.decide(value)[0]: return
+            seen.add(value)
+            items.append({"value":value,"why":why,"stage":stage,"rank":str(HUNT_RANK.get(why,9)),
+                          "active":str(stage in ACTIVE)})
+        def host_of(v:str)->str:
+            return (urlsplit(v if "://" in v else "//"+v).hostname or "").lower()
+        def ordered(values:Iterable[str])->list[str]:
+            # Sensitive-looking values first, then shortest, so the most specific path leads.
+            return sorted({v.strip() for v in values if v and v.strip()},
+                          key=lambda v:(0 if HUNT_SENSITIVE.search(v) else 1,len(v),host_of(v),v))
+
+        ac=self.raw/"access-checks"
+        if (ac/"anomalies.tsv").exists():
+            for line in (ac/"anomalies.tsv").read_text(errors="replace").splitlines()[1:]:
+                c=line.split("\t")
+                if len(c)>=4 and c[0].strip(): add(c[0].strip(),"access-candidate","access-checks")
+        metrics=self.raw/"api-discovery"/"metrics.jsonl"
+        if metrics.exists():
+            for line in metrics.read_text(errors="replace").splitlines():
+                try: rec=json.loads(line)
+                except json.JSONDecodeError: continue
+                if not isinstance(rec,dict) or rec.get("error"): continue
+                status=rec.get("status")
+                if not isinstance(status,int) or not 200<=status<400: continue
+                add(str(rec.get("url") or ""),f"sensitive-path:{rec.get('probe','probe')}:{status}","api-discovery")
+        for value in ordered(self.read("corpus")):
+            if HUNT_SENSITIVE.search(value): add(value,"sensitive-path","corpus")
+        for value in ordered(self.read("ffuf")): add(value,"discovered-path","ffuf")
+        for value in ordered(self.read("web-intelligence")): add(value,"discovered-endpoint","web-intelligence")
+        for value in ordered(self.read("arjun")): add(value,"discovered-endpoint","arjun")
+        for value in ordered(self.read("httpx")): add(value,"live-host","httpx")
+        for value in ordered(self.read("ports")):
+            parsed=urlsplit(value if "://" in value else "//"+value)
+            try: port=parsed.port
+            except ValueError: port=None
+            add(value,"unusual-port" if port in UNUSUAL_PORTS else "open-port","ports")
+        for value in ordered(self.read("javascript")): add(value,"javascript","javascript")
+        items.sort(key=lambda i:(int(i["rank"]),
+                                 0 if HUNT_SENSITIVE.search(i["value"]) else 1,
+                                 len(i["value"]),i["value"]))
+        return items[:limit]
+
     def generate_reports(self,rc:int)->None:
         self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=f"autorecon {self.seed} --resume {self.run_id} --output-dir {self.out}"
-        report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"vulnerability_claims":[],"stages":stages}
+        hunt=self.hunt_queue()
+        report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"hunt_queue":hunt,"vulnerability_claims":[],"stages":stages}
         atomic_json(self.work/"report.json",report)
         with (self.work/"stages.csv").open("w",newline="") as f:
             w=csv.writer(f); w.writerow(["stage","status","processed","total","runtime_seconds","exit_code","reason"]); w.writerows([[s["id"],s["status"],s["processed"],s["total"],s["runtime_seconds"],s["exit_code"],s["failure_reason"]] for s in stages])
         lines=[f"# AutoRecon v8 — Raccoon 4K\n\nTarget: `{self.seed}`  \nRun: `{self.run_id}`  \nStatus: **{report['status']}**\n", "## Stage summary\n", "| Stage | Status | Progress | Runtime | Reason |\n|---|---|---:|---:|---|"]
         lines += [f"| {s['id']} | {s['status']} | {s['processed']}/{s['total']} | {s['runtime_seconds']}s | {s['failure_reason'] or ''} |" for s in stages]
+        lines += ["\n## Hunt queue\n"]
+        if hunt:
+            lines += ["| # | Why | Rank | Stage | Active | Value |","|---:|---|---:|---|---|---|"]
+            lines += [f"| {i} | `{item['why']}` | {item['rank']} | {item['stage']} | {item['active']} | `{item['value']}` |" for i,item in enumerate(hunt,1)]
+        else:
+            lines.append("No ranked candidates.")
         lines += ["\n## Evidence\n",f"- Raw evidence: `{self.raw}`",f"- Commands: `{self.command_log}`",f"- Scope decisions: `{self.scope_log}`","\n## Vulnerability claims\n\nNo automated candidate is represented as a validated vulnerability.",f"\n## Resume\n\n`{resume}`\n"]
         (self.work/"report.md").write_text("\n".join(lines))
         try:
