@@ -102,6 +102,16 @@ PROFILES: dict[str,dict[str,Any]] = {
  "custom":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":600.0,"stage_timeout":1200.0,"max_hosts":500,"skip":[]},
 }
 
+# The external binary each stage shells out to, or "" for a stage that needs none. Lives here rather
+# than inside generic_stage so the preflight and generic_stage cannot disagree about what a stage
+# requires - a preflight built from a second hand-written copy of this map is a preflight that lies.
+STAGE_TOOLS: dict[str,str] = {
+    "dns":"dig","subdomains":"subfinder","dnsx":"dnsx","tls":"tlsx","httpx":"httpx",
+    "screenshots":"httpx","ports":"naabu","crawl":"katana","archives":"gau",
+    "javascript":"curl","web-intelligence":"curl","arjun":"arjun","ffuf":"ffuf",
+    "access-checks":"curl","corpus":"","api-discovery":"","report":"",
+}
+
 SOURCE_MAP_RE = re.compile(r"[ \t]*(?://[#@]|/\*[#@])\s*sourceMappingURL\s*=\s*([^\s*'\"]+)")
 JS_MAX_BYTES = 4_000_000
 JS_EXTS = (".js", ".mjs")
@@ -926,6 +936,15 @@ class Runner:
         existing=set(path.read_text().splitlines()) if path.exists() else set(); existing.update(x for x in values if x); path.parent.mkdir(parents=True,exist_ok=True); path.write_text("".join(x+"\n" for x in sorted(existing)))
     def run(self)->int:
         (self.out/"last").write_text(self.run_id); rc=0
+        # Advisory. A missing tool never blocks a run - a target with no naabu still gets DNS, TLS
+        # and HTTP discovery, and refusing to start would throw that away over a capability the
+        # operator may not even have wanted. Printed before the first stage rather than discovered at
+        # the stage that needs it, which can be hours in.
+        absent=[(s,t) for s,t,ok in self.preflight() if not ok]
+        if absent:
+            print("autorecon: preflight: "+", ".join(f"{s} needs {t} (not found)" for s,t in absent)
+                  +f" -- {len(absent)} stage(s) will report a skip with this reason; the run continues",
+                  file=sys.stderr,flush=True)
         blocked=[s for s in STAGE_IDS if s in self.selected and s in UNIMPLEMENTED]
         if blocked:
             print("autorecon: warning: unimplemented stage(s) scheduled: "+", ".join(blocked)+" -- these will be reported as unimplemented, not completed",file=sys.stderr,flush=True)
@@ -991,6 +1010,25 @@ class Runner:
         return limit_values(values,self.args.max_hosts)
     def read(self,sid:str)->list[str]:
         p=self.raw/sid/"normalized.txt"; return p.read_text().splitlines() if p.exists() else []
+    def preflight(self)->list[tuple[str,str,bool]]:
+        """What this run is missing, before it spends anything discovering it.
+
+        Every stage that shells out already degrades to a skip-with-a-reason when its tool is absent,
+        and that is the right behaviour: a missing naabu is not a reason to refuse to start, because
+        passive discovery without it is still worth running. The cost is that a missing tool is not
+        discovered until the stage that needs it, which can be hours in. This is the same information
+        up front, and it is advisory only - it never blocks a run.
+
+        Returns (stage, tool, available) for each selected stage that needs an external tool. A tool
+        that is absent is still listed, with available=False, so a caller can print the whole table
+        rather than inferring what is missing from what is present.
+
+        resolve_tool, not shutil.which: Debian ships an unrelated program called httpx, so a naive
+        which() reports the tool as present and the stage then fails looking like a target problem.
+        """
+        return [(sid,tool,bool(resolve_tool(tool))) for sid,tool in STAGE_TOOLS.items()
+                if tool and sid in self.selected]
+
     def generic_stage(self,st:StageState,deadline:float)->None:
         values=self.inputs(st.id); st.total=len(values); dest=self.raw/st.id/"normalized.txt"; st.inputs=[str(x) for x in values]; st.outputs=[str(dest)]
         if st.id in UNIMPLEMENTED:
@@ -998,7 +1036,7 @@ class Runner:
             self.write_lines(dest,values)
             print(f"[{st.id}] unimplemented: no runner for this stage, {len(values)} candidate(s) listed for manual follow-up",flush=True)
             return
-        tool={"dns":"dig","subdomains":"subfinder","dnsx":"dnsx","tls":"tlsx","httpx":"httpx","screenshots":"httpx","ports":"naabu","crawl":"katana","archives":"gau","javascript":"curl","web-intelligence":"curl","arjun":"arjun","ffuf":"ffuf","access-checks":"curl"}.get(st.id)
+        tool=STAGE_TOOLS.get(st.id) or None
         if not values: st.status="skipped"; st.failure_reason="empty input"; return
         if tool and not shutil.which(tool): st.status="skipped"; st.failure_reason=f"missing external tool: {tool}"; return
         if self.args.dry_run: self.write_lines(dest,values); st.processed=st.total; return
