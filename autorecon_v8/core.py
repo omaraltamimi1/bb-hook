@@ -33,7 +33,7 @@ DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archive
 # execute(), or report generation. Every other stage is routed out of the generic fallback and
 # reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
 # added stage cannot escape classification.
-STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "access-checks", "report"}
+STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "arjun", "access-checks", "report"}
 UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
 assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
 
@@ -299,6 +299,68 @@ def access_signals(states: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
                     "verify": "capture the full body and confirm it discloses internal paths, versions or query fragments"})
     return out
 
+ARJUN_DEFAULT_MAX = 15
+
+
+def arjun_parse(payload: str) -> list[tuple[str, list[str], str]]:
+    """
+    Parse arjun's -o JSON into (base_url, parameter names, method) triples.
+
+    arjun's JSON is {url: {"params": [...], "method": "GET", "headers": {...}}}.
+    Entries without a usable parameter list are dropped, and a url that does not
+    parse is skipped rather than guessed at.
+    """
+    try:
+        data = json.loads(payload or "{}")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: list[tuple[str, list[str], str]] = []
+    for url, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        params = entry.get("params")
+        if isinstance(params, str):
+            params = [params]
+        if not isinstance(params, list) or not params:
+            continue
+        names = [str(p).strip() for p in params if str(p).strip()]
+        if not names:
+            continue
+        try:
+            parsed = urlsplit(str(url))
+        except ValueError:
+            continue
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            continue
+        out.append((str(url), names, str(entry.get("method") or "GET").upper()))
+    return out
+
+
+def query_param_names(url: str) -> set[str]:
+    try:
+        return {k for k, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True) if k}
+    except ValueError:
+        return set()
+
+
+def with_params(url: str, names: list[str]) -> str:
+    """Rebuild a target URL carrying the discovered parameter names, order preserved."""
+    try:
+        u = urlsplit(url)
+    except ValueError:
+        return url
+    existing = []
+    try:
+        existing = parse_qsl(u.query, keep_blank_values=True)
+    except ValueError:
+        existing = []
+    have = {k for k, _ in existing}
+    pairs = list(existing) + [(n, "1") for n in names if n not in have]
+    return urlunsplit((u.scheme, u.netloc, u.path, urlencode(pairs), ""))
+
+
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True); fd,tmp=tempfile.mkstemp(prefix=".state-",dir=path.parent)
@@ -464,6 +526,7 @@ class Runner:
             elif st.id=="corpus": self.corpus_stage(st,deadline)
             elif st.id=="crawl": self.crawl_stage(st,deadline)
             elif st.id=="access-checks": self.access_checks_stage(st,deadline)
+            elif st.id=="arjun": self.arjun_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -682,16 +745,25 @@ class Runner:
         except (OSError,http.client.HTTPException) as e:
             return {"status":0,"length":0,"sha256":"","json_keys":[],"stack_trace":False,"location":"","error":f"{type(e).__name__}: {e}"}
         finally: conn.close()
+    ACCESS_CHECK_INPUTS=(("corpus","params.txt"),("corpus","api.txt"),("arjun","params.txt"))
     def access_check_targets(self)->tuple[list[str],list[str]]:
-        """Targets from the corpus partitions this stage cares about, with provenance."""
-        params=[v for v in self.read_partition("params.txt") if v]
-        api=[v for v in self.read_partition("api.txt") if v]
-        ordered:list[str]=[]; seen=set()
-        for url in params+api:
-            if url not in seen: seen.add(url); ordered.append(url)
-        return ordered,["params.txt","api.txt"]
-    def read_partition(self,name:str)->list[str]:
-        p=self.raw/"corpus"/name
+        """Targets from every partition this stage cares about, with provenance.
+
+        Sources are read from their own stage directories and merged in memory, so no stage
+        writes into another stage's artifacts and each producer stays independently
+        auditable. corpus owns the canonical partitions; arjun contributes parameter names it
+        discovered by probing, which corpus could not know before arjun ran.
+        """
+        ordered:list[str]=[]; seen=set(); provenance:list[str]=[]
+        for stage,name in self.ACCESS_CHECK_INPUTS:
+            values=[v for v in self.read_partition(name,stage) if v]
+            if not values: continue
+            provenance.append(f"{stage}/{name}")
+            for url in values:
+                if url not in seen: seen.add(url); ordered.append(url)
+        return ordered,provenance
+    def read_partition(self,name:str,stage:str="corpus")->list[str]:
+        p=self.raw/stage/name
         return [ln.strip() for ln in p.read_text(errors="replace").splitlines() if ln.strip()] if p.exists() else []
     def access_checks_stage(self,st:StageState,deadline:float)->None:
         root=self.raw/st.id; dest=root/"normalized.txt"
@@ -751,6 +823,69 @@ class Runner:
         print(f"[access-checks] {st.processed}/{len(targets)} target(s) probed across {len(states_available)} state(s): {len(real)} candidate(s), {len(suppressed)} suppressed, {len(set(refused))} refused out-of-scope",flush=True)
         if refused: st.failure_reason=f"{len(set(refused))} out-of-scope target(s) or callback(s) refused"
         if not real: st.status="completed"
+    def arjun_stage(self,st:StageState,deadline:float)->None:
+        pool=[v for v in self.read("corpus") if v.lower().startswith(("http://","https://"))]
+        seen=set(); targets=[v for v in pool if not (v in seen or seen.add(v))]
+        root=self.raw/st.id; dest=root/"normalized.txt"
+        cap=int(getattr(self.args,"arjun_max",0) or ARJUN_DEFAULT_MAX)
+        targets=targets[:cap]
+        st.total=len(targets); st.inputs=targets
+        if not targets:
+            st.status="skipped"; st.failure_reason="no HTTP URLs in corpus to probe"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+        tool=shutil.which("arjun")
+        if not tool:
+            st.status="skipped"; st.failure_reason="missing external tool: arjun"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+        if self.args.dry_run:
+            self.write_lines(dest,targets); st.processed=st.total; st.outputs=[str(dest)]; return
+        root.mkdir(parents=True,exist_ok=True)
+        input_file=root/"inputs.txt"; self.write_lines(input_file,targets)
+        json_out=root/"arjun.json"; text_out=root/"arjun.txt"
+        headers_file=root/"arjun-headers.txt"
+        identity=self.identities.get("a") or {}
+        self.write_lines(headers_file,[f"{k}: {v}" for k,v in identity.items()])
+        cmd=[tool,"-i",str(input_file),"-o",str(json_out),"-oT",str(text_out),"-q",
+             "-t",str(max(1,min(self.args.concurrency,10))),
+             "-T",str(max(1,int(self.args.request_timeout)))]
+        delay=max(0.0,float(getattr(self.args,"arjun_delay",0) or 0))
+        if delay: cmd+=["-d",str(delay)]
+        if identity: cmd+=["--headers",str(headers_file)]
+        if getattr(self.args,"arjun_passive",False): cmd+=["--passive"]
+        if getattr(self.args,"arjun_wordlist",None): cmd+=["-w",str(self.args.arjun_wordlist)]
+        rc=self.command(st.id,cmd,self.host,deadline,root/"stdout.txt",cwd=root); st.exit_code=rc
+        payload=json_out.read_text(errors="replace") if json_out.exists() else ""
+        triples=arjun_parse(payload)
+        rows:list[str]=[]; inventory:list[dict[str,Any]]=[]; discovered:list[str]=[]
+        enriched_params:list[str]=[]; enriched_api:list[str]=[]
+        for url,names,method in triples:
+            self.check(deadline)
+            if not self.scope.decide(url)[0]: continue
+            fresh=[n for n in names if n not in query_param_names(url)]
+            rebuilt=with_params(url,names)
+            if not self.scope.decide(rebuilt)[0]: continue
+            discovered.append(rebuilt)
+            rows.append("\t".join([url,method,",".join(names),str(len(fresh)),rebuilt]))
+            inventory.append({"url":url,"method":method,"params":names,"new_params":fresh,"probed_url":rebuilt})
+            if fresh:
+                for name in fresh: enriched_params.append(f"{url}{'&' if '?' in url else '?'}{name}=1")
+                if is_api_url(url): enriched_api.append(rebuilt)
+        self.write_lines(dest,rows)
+        atomic_json(root/"params.json",{"generated_at":now(),"run_id":self.run_id,"targets_probed":len(targets),
+            "targets_with_params":len(inventory),"candidates_not_probed":max(0,len(self.read("corpus"))-len(targets)),
+            "parameters":inventory,
+            "disclaimer":"parameter names discovered by differential probing. A name here is not a vulnerability; combine it with the authorization differential in access-checks.","own_artifact_directory":"arjun","corpus_artifacts_modified":False,"consumed_by":["access-checks:corpus/params.txt","access-checks:corpus/api.txt","access-checks:arjun/params.txt"]})
+        # arjun owns its artifacts. corpus/classify.tsv and corpus counts stay truthful because
+        # nothing downstream of corpus is rewritten after the fact; consumers merge instead.
+        self.write_lines(root/"params.txt",enriched_params)
+        self.write_lines(root/"api.txt",enriched_api)
+        st.outputs=[str(dest),str(root/"params.json"),str(root/"params.txt"),str(root/"api.txt")]
+        st.processed=len(targets)
+        new_names=sorted({n for item in inventory for n in item["new_params"]})
+        print(f"[arjun] {len(targets)} target(s) probed, {len(inventory)} carried parameters, {len(new_names)} new name(s): {', '.join(new_names[:12]) or 'none'}",flush=True)
+        if not inventory:
+            if rc: st.status="partial"; st.failure_reason=f"arjun exited {rc} and reported no parameters"
+            else: st.status="completed"; st.failure_reason="arjun reported no parameters on any target"
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
