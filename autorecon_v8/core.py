@@ -22,13 +22,21 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-STATUSES = {"pending", "running", "completed", "partial", "failed", "skipped", "interrupted"}
+STATUSES = {"pending", "running", "completed", "partial", "failed", "skipped", "interrupted", "unimplemented"}
 STAGE_IDS = ["dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports", "crawl", "archives", "corpus", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks", "report"]
 ACTIVE = {"screenshots", "ports", "crawl", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks"}
 DESCRIPTIONS = {
  "dns":"Collect DNS records", "subdomains":"Enumerate passive subdomains", "dnsx":"Resolve discovered names", "tls":"Collect TLS metadata", "httpx":"Identify HTTP origins", "screenshots":"Capture visual evidence", "ports":"Discover ports", "crawl":"Crawl live applications", "archives":"Collect archived URLs", "corpus":"Normalize and deduplicate URLs", "javascript":"Preserve and inspect JavaScript", "api-discovery":"Read-only API and identity probes", "web-intelligence":"Collect web metadata", "arjun":"Discover parameters", "nmap":"Validate exposed services", "ffuf":"Discover content", "access-checks":"Read-only access differentials", "report":"Publish reports"}
 DEPS = {s: ([STAGE_IDS[i-1]] if i else []) for i,s in enumerate(STAGE_IDS)}
 DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"nmap":["ports"],"ffuf":["httpx"],"access-checks":["corpus"],"report":[]})
+# Stages with a real implementation: a cmds entry in generic_stage, a method dispatched from
+# execute(), or report generation. Every other stage is routed out of the generic fallback and
+# reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
+# added stage cannot escape classification.
+STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "api-discovery", "javascript", "report"}
+UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
+assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
+
 PROFILES: dict[str,dict[str,Any]] = {
  "passive":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":500,"skip":sorted(ACTIVE)},
  "fast":{"concurrency":8,"rate_limit":20.0,"request_timeout":8.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":200,"skip":["screenshots","nmap","ffuf"]},
@@ -36,6 +44,24 @@ PROFILES: dict[str,dict[str,Any]] = {
  "deep":{"concurrency":20,"rate_limit":10.0,"request_timeout":20.0,"tool_timeout":1800.0,"stage_timeout":7200.0,"max_hosts":5000,"skip":[]},
  "custom":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":600.0,"stage_timeout":1200.0,"max_hosts":500,"skip":[]},
 }
+
+SOURCE_MAP_RE = re.compile(r"[ \t]*(?://[#@]|/\*[#@])\s*sourceMappingURL\s*=\s*([^\s*'\"]+)")
+JS_MAX_BYTES = 4_000_000
+JS_EXTS = (".js", ".mjs")
+
+
+def source_map_refs(text: str) -> list[str]:
+    """Return sourceMappingURL targets declared by a bundle, in order, deduped.
+
+    Accepts both the //# form and the /*# */ form, with @ as a legacy variant.
+    """
+    refs: list[str] = []
+    for ref in SOURCE_MAP_RE.findall(text or ""):
+        ref = ref.strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
 
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
@@ -163,6 +189,12 @@ class Runner:
         existing=set(path.read_text().splitlines()) if path.exists() else set(); existing.update(x for x in values if x); path.parent.mkdir(parents=True,exist_ok=True); path.write_text("".join(x+"\n" for x in sorted(existing)))
     def run(self)->int:
         (self.out/"last").write_text(self.run_id); rc=0
+        blocked=[s for s in STAGE_IDS if s in self.selected and s in UNIMPLEMENTED]
+        if blocked:
+            print("autorecon: warning: unimplemented stage(s) scheduled: "+", ".join(blocked)+" -- these will be reported as unimplemented, not completed",file=sys.stderr,flush=True)
+            if getattr(self.args,"strict_stages",False):
+                print("autorecon: --strict-stages set, refusing to run with unimplemented stage(s)",file=sys.stderr,flush=True)
+                return 2
         try:
             for sid in STAGE_IDS:
                 st=self.stages[sid]
@@ -189,6 +221,7 @@ class Runner:
         try:
             if st.id=="report": self.generate_reports(0)
             elif st.id=="api-discovery": self.api_stage(st,deadline)
+            elif st.id=="javascript": self.javascript_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -211,6 +244,11 @@ class Runner:
         p=self.raw/sid/"normalized.txt"; return p.read_text().splitlines() if p.exists() else []
     def generic_stage(self,st:StageState,deadline:float)->None:
         values=self.inputs(st.id); st.total=len(values); dest=self.raw/st.id/"normalized.txt"; st.inputs=[str(x) for x in values]; st.outputs=[str(dest)]
+        if st.id in UNIMPLEMENTED:
+            st.status="unimplemented"; st.failure_reason="no runner on this branch; candidates listed for manual follow-up"
+            self.write_lines(dest,values)
+            print(f"[{st.id}] unimplemented: no runner for this stage, {len(values)} candidate(s) listed for manual follow-up",flush=True)
+            return
         tool={"dns":"dig","subdomains":"subfinder","dnsx":"dnsx","tls":"tlsx","httpx":"httpx","screenshots":"httpx","ports":"naabu","crawl":"katana","archives":"gau","javascript":"curl","web-intelligence":"curl","arjun":"arjun","nmap":"nmap","ffuf":"ffuf","access-checks":"curl"}.get(st.id)
         if not values: st.status="skipped"; st.failure_reason="empty input"; return
         if tool and not shutil.which(tool): st.status="skipped"; st.failure_reason=f"missing external tool: {tool}"; return
@@ -225,8 +263,64 @@ class Runner:
             self.write_lines(dest,lines); st.processed=st.total
             if rc: st.status="partial" if lines else "failed"; st.failure_reason=f"tool exited {rc}"
         else:
-            # Complex active integrations retain a deterministic candidate list for explicit operator/tool follow-up.
-            for i,v in enumerate(values,1): self.check(deadline); self.log_scope(v); self.write_lines(dest,[v]); st.processed=i; print(f"[{st.id}] {i}/{st.total} {v} | elapsed={fmt(time.monotonic()-(deadline-self.args.stage_timeout))}",flush=True)
+            raise RuntimeError(f"stage {st.id!r} reached the generic fallback but is classified as implemented; add a cmds entry or a dispatch branch")
+    def _http_get(self,url:str,deadline:float,limit:int=JS_MAX_BYTES)->tuple[int,bytes]:
+        u=urlsplit(url)
+        if not u.hostname: return 0,b""
+        timeout=max(.1,min(self.args.request_timeout,deadline-time.monotonic()))
+        conn=(http.client.HTTPSConnection if u.scheme=="https" else http.client.HTTPConnection)(u.hostname,u.port,timeout=timeout)
+        try:
+            conn.request("GET",urlunsplit(("", "",u.path or "/",u.query,"")),headers={"User-Agent":"AutoRecon/8","Accept":"*/*"})
+            resp=conn.getresponse(); return resp.status,resp.read(limit)
+        except (OSError,http.client.HTTPException) as e:
+            return 0,str(e).encode()
+        finally: conn.close()
+    def javascript_stage(self,st:StageState,deadline:float)->None:
+        raw_inputs=self.inputs(st.id)
+        values=[v for v in raw_inputs if urlsplit(v).path.lower().endswith(JS_EXTS)]
+        seen=set(); values=[v for v in values if not (v in seen or seen.add(v))]
+        root=self.raw/st.id; dest=root/"normalized.txt"; st.total=len(values); st.inputs=values
+        if not values:
+            st.status="skipped"; st.failure_reason="no javascript URLs in corpus"; st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+        if self.args.dry_run: self.write_lines(dest,values); st.processed=st.total; st.outputs=[str(dest)]; return
+        root.mkdir(parents=True,exist_ok=True); input_file=root/"inputs.txt"; self.write_lines(input_file,values)
+        bundles:list[str]=[]; maps:list[str]=[]; refs:list[str]=[]; rows:list[tuple[str,str,str,str]]=[]
+        lock=threading.Lock()
+        def one(idx:int,url:str)->None:
+            self.check(deadline)
+            status,body=self._http_get(url,deadline)
+            entry=[str(idx),url,str(status),str(len(body)),"","",""]
+            if status==200 and body:
+                name=f"{idx:05d}-"+re.sub(r"[^A-Za-z0-9._-]","_",urlsplit(url).path.rsplit("/",1)[-1] or "bundle.js")[:120]
+                if not name.endswith(JS_EXTS): name+=".js"
+                bundle=root/name; bundle.write_bytes(body); entry[4]=str(bundle)
+                found=source_map_refs(body[-8192:].decode("utf-8","ignore")) or source_map_refs(body.decode("utf-8","ignore"))
+                if found:
+                    target=urljoin(url,found[0]); entry[5]=target; entry[6]=found[0]
+                    # A bundle controls this URL, so it is untrusted input: re-check scope before fetching.
+                    if self.scope.decide(target)[0]:
+                        mstatus,mbody=self._http_get(target,deadline)
+                        if mstatus==200 and mbody:
+                            mname=name[:-3]+".js.map"; mpath=root/mname; mpath.write_bytes(mbody); entry[6]=str(mpath)
+            with lock: rows.append((entry[1],entry[2],entry[4],entry[6])); st.processed+=1
+            if entry[4]: bundles.append(entry[4])
+            if entry[5]: refs.append("\t".join([url,found[0],entry[5],entry[6] if entry[6].startswith(str(root)) else ""]))
+            if entry[6].startswith(str(root)): maps.append(entry[6])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,self.args.concurrency)) as ex:
+            futures=[ex.submit(one,i,u) for i,u in enumerate(values)]
+            for f in futures:
+                self.check(deadline)
+                try: f.result(timeout=max(.1,deadline-time.monotonic()))
+                except (Deadline,Interrupted): raise
+                except Exception as e: print(f"[javascript] {type(e).__name__}: {e}",file=sys.stderr,flush=True)
+        self.write_lines(dest,[("\t".join(r)) for r in sorted(set(rows))])
+        self.write_lines(root/"bundles.txt",sorted(set(bundles)))
+        self.write_lines(root/"maps.txt",sorted(set(maps)))
+        self.write_lines(root/"source-map-refs.txt",sorted(set(refs)))
+        st.outputs=[str(dest),str(root/"bundles.txt"),str(root/"maps.txt"),str(root/"source-map-refs.txt")]
+        print(f"[javascript] {st.processed}/{st.total} bundle(s), {len(set(maps))} source map(s)",flush=True)
+        if st.processed<st.total:
+            st.status="partial"; st.failure_reason=f"{st.total-st.processed} bundle(s) did not complete"
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
