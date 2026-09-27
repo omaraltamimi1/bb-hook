@@ -88,8 +88,17 @@ assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) |
 PROFILES: dict[str,dict[str,Any]] = {
  "passive":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":500,"skip":sorted(ACTIVE)},
  "fast":{"concurrency":8,"rate_limit":20.0,"request_timeout":8.0,"tool_timeout":300.0,"stage_timeout":600.0,"max_hosts":200,"skip":["screenshots","ffuf"]},
- "balanced":{"concurrency":10,"rate_limit":15.0,"request_timeout":12.0,"tool_timeout":900.0,"stage_timeout":1800.0,"max_hosts":1000,"skip":[]},
- "deep":{"concurrency":20,"rate_limit":10.0,"request_timeout":20.0,"tool_timeout":1800.0,"stage_timeout":7200.0,"max_hosts":5000,"skip":[]},
+ # daily is the profile the real whatnot run used. Its tool_timeout/stage_timeout pair is the one that
+ # matters: v8.1 ran tool_timeout=600 against stage_timeout=1500, and a single naabu call over 90 hosts
+ # could not finish inside 600s, so ports died rc=124 and everything downstream skipped. A stage can no
+ # longer hang a whole run that way (ports chunks per invocation and keeps partial work), but the ratio
+ # is kept so the two knobs still mean what they meant in v8.1.
+ #
+ # max_hosts=0 means uncapped, as in v8.1. balanced/deep carried numeric caps here and 0 there; 0 is
+ # what "no cap" means, so those are corrected rather than copied.
+ "daily":{"concurrency":8,"rate_limit":5.0,"request_timeout":12.0,"tool_timeout":600.0,"stage_timeout":1500.0,"max_hosts":0,"skip":["screenshots"]},
+ "balanced":{"concurrency":10,"rate_limit":15.0,"request_timeout":12.0,"tool_timeout":900.0,"stage_timeout":1800.0,"max_hosts":0,"skip":[]},
+ "deep":{"concurrency":20,"rate_limit":10.0,"request_timeout":20.0,"tool_timeout":1800.0,"stage_timeout":7200.0,"max_hosts":0,"skip":[]},
  "custom":{"concurrency":4,"rate_limit":5.0,"request_timeout":10.0,"tool_timeout":600.0,"stage_timeout":1200.0,"max_hosts":500,"skip":[]},
 }
 
@@ -975,7 +984,11 @@ class Runner:
         values=[]
         for value in mapping.get(sid,[self.host]):
             if value and value not in values and self.scope.decide(value)[0]: values.append(value)
-        return values[:self.args.max_hosts]
+        # limit_values, not a bare slice: max_hosts=0 means uncapped, and values[:0] is empty. A bare
+        # slice here made every profile with an uncapped budget feed zero inputs to every stage, so the
+        # run reported itself complete having looked at nothing. v8.1 routed all of these through
+        # limit_values; this call site and api_stage were the two that did not.
+        return limit_values(values,self.args.max_hosts)
     def read(self,sid:str)->list[str]:
         p=self.raw/sid/"normalized.txt"; return p.read_text().splitlines() if p.exists() else []
     def generic_stage(self,st:StageState,deadline:float)->None:
@@ -1680,7 +1693,7 @@ class Runner:
             if rc: st.status="partial"; st.failure_reason=f"arjun exited {rc} and reported no parameters"
             else: st.status="completed"; st.failure_reason="arjun reported no parameters on any target"
     def api_stage(self,st:StageState,deadline:float)->None:
-        origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
+        origins=limit_values([o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)],self.args.max_hosts); st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
         probes=[("openapi","/openapi.json"),("swagger","/swagger.json"),("graphql","/graphql"),("scim-users","/scim/v2/Users?count=1"),("scim-groups","/scim/v2/Groups?count=1"),("oidc","/.well-known/openid-configuration"),("keycloak","/realms/master/.well-known/openid-configuration")]
         lock=threading.Lock(); results=[]

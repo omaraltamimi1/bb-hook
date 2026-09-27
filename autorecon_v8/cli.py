@@ -40,7 +40,14 @@ def main(argv=None):
  if not a.target:p.error("target is required unless --list-stages is used")
  defaults=PROFILES[a.profile]
  apply_profile_defaults(a)
- if min(a.request_timeout,a.tool_timeout,a.stage_timeout,a.max_hosts,a.concurrency,a.rate_limit)<=0:p.error("limits must be positive")
+ # Limits and caps are not the same kind of number. A limit is a duration or a width and 0 would mean
+ # "do nothing", which is never what anyone asking for it means. A cap is a ceiling on how much gets
+ # processed, and 0 is the documented sentinel for "no ceiling" - every stage that consumes one treats
+ # it as unlimited. Validating them in one min() made max_hosts=0 unpassable, so the daily profile
+ # (max_hosts=0, uncapped) could not be selected at all: the tool exited before running anything.
+ # They are checked separately, the way v8.1 did.
+ if min(a.request_timeout,a.tool_timeout,a.stage_timeout,a.concurrency,a.rate_limit)<=0:p.error("limits must be positive")
+ if a.max_hosts<0:p.error("max-hosts must be 0 (unlimited) or a positive number")
  try:return Runner(a).run()
  except (ValueError,OSError) as e: print(f"autorecon: error: {e}",file=sys.stderr); return 2
 if __name__=="__main__":raise SystemExit(main())
