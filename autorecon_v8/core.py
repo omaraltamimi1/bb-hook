@@ -991,6 +991,16 @@ class Runner:
         # nothing, with no indication that the requested port was never touched.
         _u=urlsplit(self.seed); _default=443 if _u.scheme=="https" else 80
         self.probe_target=f"{self.host}:{_u.port}" if _u.port and _u.port!=_default else self.host; self.stop=threading.Event(); self.child:subprocess.Popen[str]|None=None
+        # Program-supplied headers, e.g. the HackerOne identity header a program asks for on requests
+        # that cannot carry a test account's alias. Split on the first colon only, so a value may
+        # contain one. A malformed header is refused rather than dropped: an identity header that
+        # silently did not go out leaves the run unattributable and looks exactly like a run that
+        # never had one.
+        self.extra_headers:dict[str,str]={}
+        for raw in getattr(args,"header",None) or []:
+            name,sep,value=raw.partition(":")
+            if not sep or not name.strip(): raise ValueError(f"--header must be 'Name: value', got {raw!r}")
+            self.extra_headers[name.strip()]=value.strip()
         self.jar=CookieJar()
         self.identities={"anon":{},"a":{},"b":{}}
         if getattr(args,"cookie_file",None): self.identities["a"]=load_credentials(args.cookie_file)
@@ -1244,7 +1254,7 @@ class Runner:
         timeout=max(.1,min(self.args.request_timeout,deadline-time.monotonic()))
         conn=(http.client.HTTPSConnection if u.scheme=="https" else http.client.HTTPConnection)(u.hostname,u.port,timeout=timeout)
         try:
-            headers={"User-Agent":"AutoRecon/8","Accept":"*/*"}
+            headers={"User-Agent":"AutoRecon/8","Accept":"*/*",**getattr(self,"extra_headers",{})}
             cookie=self.jar.header_for(u.hostname)
             if cookie: headers["Cookie"]=cookie
             conn.request("GET",urlunsplit(("", "",u.path or "/",u.query,"")),headers=headers)
@@ -1421,7 +1431,10 @@ class Runner:
         if not u.hostname: return {"status":0,"length":0,"sha256":"","json_keys":[],"stack_trace":False,"location":"","error":"no host"}
         timeout=max(.1,min(self.args.request_timeout,deadline-time.monotonic()))
         conn=(http.client.HTTPSConnection if u.scheme=="https" else http.client.HTTPConnection)(u.hostname,u.port,timeout=timeout)
-        send={"User-Agent":"AutoRecon/8","Accept":"*/*",**headers}
+        # Program headers are applied last, deliberately. Applied first they lose to the
+        # caller's dict, and a stage could then silently displace the identity header the
+        # program asked for - which is the outcome nobody would notice.
+        send={"User-Agent":"AutoRecon/8","Accept":"*/*",**headers,**getattr(self,"extra_headers",{})}
         try:
             conn.request("GET",urlunsplit(("", "",u.path or "/",u.query,"")),headers=send)
             resp=conn.getresponse(); body=resp.read(ACCESS_BODY_LIMIT)
@@ -1955,7 +1968,7 @@ class Runner:
                 u=urlsplit(urljoin(o,path)); assert u.hostname is not None
                 conn=(http.client.HTTPSConnection if u.scheme=="https" else http.client.HTTPConnection)(u.hostname,u.port,timeout=min(self.args.request_timeout,max(.1,deadline-time.monotonic())))
                 try:
-                    conn.request(method,urlunsplit(("","",u.path,u.query,"")),body=body,headers={"Content-Type":"application/json","User-Agent":"AutoRecon/8"}); resp=conn.getresponse(); data=resp.read(2_000_000)
+                    conn.request(method,urlunsplit(("","",u.path,u.query,"")),body=body,headers={"Content-Type":"application/json","User-Agent":"AutoRecon/8",**getattr(self,"extra_headers",{})}); resp=conn.getresponse(); data=resp.read(2_000_000)
                     p=self.raw/st.id/f"{idx:05d}-{name}.body"; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(data)
                     local.append({"origin":o,"probe":name,"url":urljoin(o,path),"status":resp.status,"bytes":len(data),"body":str(p),"timestamp":now()})
                 except (OSError,http.client.HTTPException) as e: local.append({"origin":o,"probe":name,"error":str(e),"timestamp":now()})
