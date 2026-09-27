@@ -751,7 +751,7 @@ class Runner:
     def corpus_stage(self,st:StageState,deadline:float)->None:
         raw_inputs=self.inputs(st.id); root=self.raw/st.id
         dest=root/"normalized.txt"; st.total=len(raw_inputs); st.inputs=[str(x) for x in raw_inputs]
-        canonical:dict[str,str]={}
+        canonical:dict[str,str]={}; rejected:list[str]=[]
         for value in raw_inputs:
             self.check(deadline)
             if not isinstance(value,str): continue
@@ -759,7 +759,11 @@ class Runner:
                 if not candidate: continue
                 url=canonical_url(candidate)
                 if not url: continue
-                if not self.scope.decide(url)[0]: continue
+                if not self.scope.decide(url)[0]:
+                    # Record the refusal. crawl already writes dropped-out-of-scope.txt, and
+                    # corpus filtering silently made the two stages disagree about what happened
+                    # to a hostile URL that arrived through an archive feed rather than the crawler.
+                    rejected.append(url); continue
                 canonical[url]=url
                 break
         if not canonical:
@@ -776,6 +780,7 @@ class Runner:
         params=[u for u in signal if has_parameters(u)]
         plain=[u for u in signal if not is_api_url(u) and not has_parameters(u) and not urlsplit(u).path.lower().endswith(CORPUS_JS_EXTS)]
         self.write_lines(dest,signal)
+        self.write_lines(root/"dropped-out-of-scope.txt",rejected)
         self.write_lines(root/"javascript.txt",javascript)
         self.write_lines(root/"api.txt",api)
         self.write_lines(root/"params.txt",params)

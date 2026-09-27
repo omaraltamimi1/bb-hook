@@ -64,4 +64,11 @@ class Integration(unittest.TestCase):
   finally:srv.shutdown()
  def test_large_corpus_dedupe(self):self.assertEqual(len(unique_origins(f'https://example.com/{i}' for i in range(10000))),1)
 
+def load_tests(loader,tests,pattern):
+ # unittest.main() only scans this module's namespace, so a plain import of a sibling test
+ # module is not enough to register its cases. load_tests is the supported way to extend the suite.
+ import tests.stage_coverage as stage_coverage
+ tests.addTests(loader.loadTestsFromModule(stage_coverage))
+ return tests
+
 if __name__=='__main__':unittest.main(verbosity=2)
