@@ -535,6 +535,7 @@ def access_signals(states: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 ARJUN_DEFAULT_MAX = 15
+ARJUN_BATCH = 3
 
 FFUF_DEFAULT_MAX_HOSTS = 5
 FFUF_DEFAULT_MAX_TIME = 120
@@ -965,7 +966,16 @@ class Scope:
     def __init__(self, seed:str, includes:Iterable[str]=(), excludes:Iterable[str]=(), strict:bool=True):
         self.seed=seed.lower(); self.includes=[x.lower().lstrip("*.") for x in includes] or [self.seed]; self.excludes=[x.lower().lstrip("*.") for x in excludes]; self.strict=strict
     @staticmethod
-    def match(host:str,rule:str)->bool: return host==rule or host.endswith("."+rule)
+    def match(host:str,rule:str)->bool:
+        # Mid-label wildcards have to actually match. A program scope hands you rules like
+        # developer*.earlywarning.com and ccpa*.zellepay.com, and the old exact-or-suffix test
+        # returned False for every host under them. A rule that matches nothing is worse than no
+        # rule: --scope-include silently covered nothing, and --scope-exclude ccpa*.zellepay.com
+        # silently failed to exclude a host the program had marked ineligible, so the run walked
+        # into it, found something real, and the report died at triage.
+        if "*" in rule:
+            return re.match("^"+re.escape(rule).replace(r"\*",".*")+"$",host) is not None
+        return host==rule or host.endswith("."+rule)
     def decide(self,value:str)->tuple[bool,str]:
         try: host=urlsplit(value).hostname or value.split(":",1)[0]
         except ValueError: return False,"malformed"
@@ -1926,17 +1936,33 @@ class Runner:
         # authenticated endpoints. Nothing caught it, because the argv looked correct and arjun
         # exits 0 either way. The file is still written, as evidence of what was sent.
         header_value="\n".join(header_lines)
-        cmd=[tool,"-i",str(input_file),"-o",str(json_out),"-oT",str(text_out),"-q",
-             "-t",str(max(1,min(self.args.concurrency,10))),
-             "-T",str(max(1,int(self.args.request_timeout)))]
         delay=max(0.0,float(getattr(self.args,"arjun_delay",0) or 0))
-        if delay: cmd+=["-d",str(delay)]
-        if header_value: cmd+=["--headers",header_value]
-        if getattr(self.args,"arjun_passive",False): cmd+=["--passive"]
-        if getattr(self.args,"arjun_wordlist",None): cmd+=["-w",str(self.args.arjun_wordlist)]
-        rc=self.command(st.id,cmd,self.host,deadline,root/"stdout.txt",cwd=root); st.exit_code=rc
-        payload=json_out.read_text(errors="replace") if json_out.exists() else ""
-        triples=arjun_parse(payload)
+        # Batched, for the same reason ports and crawl are. arjun only writes -o when it finishes, so
+        # one invocation over every target means a stage that overruns yields no JSON at all and takes
+        # access-checks down with it - which is exactly what the whatnot run did. Batches bound the
+        # loss to one batch, and each batch's JSON is parsed the moment it lands.
+        size=max(1,int(getattr(self.args,"arjun_batch",0) or ARJUN_BATCH))
+        batches=[targets[i:i+size] for i in range(0,len(targets),size)]
+        triples=[]; arjun_failures=[]
+        for index,batch in enumerate(batches,1):
+            self.check(deadline)
+            batch_file=root/("inputs.txt" if index==1 else f"inputs-{index:04d}.txt")
+            self.write_lines(batch_file,batch)
+            batch_json=root/("arjun.json" if index==1 else f"arjun-{index:04d}.json")
+            batch_text=root/("arjun.txt" if index==1 else f"arjun-{index:04d}.txt")
+            cmd=[tool,"-i",str(batch_file),"-o",str(batch_json),"-oT",str(batch_text),"-q",
+                 "-t",str(max(1,min(self.args.concurrency,10))),
+                 "-T",str(max(1,int(self.args.request_timeout)))]
+            if delay: cmd+=["-d",str(delay)]
+            if header_value: cmd+=["--headers",header_value]
+            if getattr(self.args,"arjun_passive",False): cmd+=["--passive"]
+            if getattr(self.args,"arjun_wordlist",None): cmd+=["-w",str(self.args.arjun_wordlist)]
+            brc=self.command(st.id,cmd,batch[0],deadline,root/"stdout.txt",cwd=root)
+            st.processed+=len(batch)
+            if brc: arjun_failures.append(f"arjun on {batch[0]} (batch {index}/{len(batches)}) exited {brc}")
+            got=batch_json.read_text(errors="replace") if batch_json.exists() else ""
+            if got: triples+=arjun_parse(got)
+        rc=1 if arjun_failures else 0; st.exit_code=rc
         rows:list[str]=[]; inventory:list[dict[str,Any]]=[]; discovered:list[str]=[]
         enriched_params:list[str]=[]; enriched_api:list[str]=[]
         for url,names,method in triples:
@@ -1964,9 +1990,13 @@ class Runner:
         st.processed=len(targets)
         new_names=sorted({n for item in inventory for n in item["new_params"]})
         print(f"[arjun] {len(targets)} target(s) probed, {len(inventory)} carried parameters, {len(new_names)} new name(s): {', '.join(new_names[:12]) or 'none'}",flush=True)
-        if not inventory:
-            if rc: st.status="partial"; st.failure_reason=f"arjun exited {rc} and reported no parameters"
-            else: st.status="completed"; st.failure_reason="arjun reported no parameters on any target"
+        if arjun_failures:
+            # Recorded even when other batches carried the stage. "arjun completed" over a partial
+            # sweep is what let access-checks look like it had run and found nothing.
+            st.status="partial"
+            st.failure_reason="; ".join(arjun_failures)+("; no parameters recovered" if not inventory else "")
+        elif not inventory:
+            st.status="completed"; st.failure_reason="arjun reported no parameters on any target"
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=limit_values([o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)],self.args.max_hosts); st.total=len(origins); st.inputs=origins
         if not origins:
