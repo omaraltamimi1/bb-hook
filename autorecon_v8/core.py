@@ -175,7 +175,7 @@ class Runner:
                 if st.status=="failed": rc=1
         except (Interrupted,KeyboardInterrupt): rc=130; self.mark_current("interrupted","signal received",130)
         except Deadline: rc=124; self.mark_current("partial","stage or global deadline expired",124)
-        except Exception as e: rc=1; self.mark_current("failed",f"{type(e).__name__}: {e}",1)
+        except Exception as e: rc=1; self.mark_current("failed",f"{type(e).__name__}: {e}",1); print(f"autorecon: unexpected error: {type(e).__name__}: {e}",file=sys.stderr,flush=True)
         finally:
             self.generate_reports(rc); self.save()
         if rc: print(f"Resume with: autorecon {self.seed} --resume {self.run_id} --output-dir {self.out}",file=sys.stderr)
@@ -185,7 +185,7 @@ class Runner:
         if self.current:
             st=self.stages[self.current]; st.status=status; st.failure_reason=reason; st.exit_code=rc; st.ended_at=now(); st.resume="retry incomplete units"; self.save()
     def execute(self,st:StageState)->None:
-        self.current=st.id; st.status="running"; st.started_at=now(); start=time.monotonic(); deadline=min(self.global_deadline,start+self.args.stage_timeout); self.save()
+        self.current=st.id; st.status="running"; st.failure_reason=None; st.exit_code=None; st.started_at=now(); start=time.monotonic(); deadline=min(self.global_deadline,start+self.args.stage_timeout); self.save()
         try:
             if st.id=="report": self.generate_reports(0)
             elif st.id=="api-discovery": self.api_stage(st,deadline)
@@ -193,6 +193,10 @@ class Runner:
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
         except Interrupted: st.status="interrupted"; st.exit_code=130; st.failure_reason="signal received"; st.resume="retry remaining units"; raise
+        except Exception as e:
+            st.status="partial" if st.processed else "failed"; st.exit_code=1
+            st.failure_reason=f"{type(e).__name__}: {e}"; st.resume="retry remaining units"
+            print(f"[{st.id}] unexpected error: {st.failure_reason}",file=sys.stderr,flush=True)
         finally: st.ended_at=now(); st.runtime_seconds=round(time.monotonic()-start,3); self.save(); self.current=None
     def inputs(self,sid:str)->list[str]:
         discovered=self.read("subdomains")
