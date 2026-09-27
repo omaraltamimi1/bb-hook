@@ -29,8 +29,51 @@ STAGE_IDS = ["dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports"
 ACTIVE = {"screenshots", "ports", "crawl", "javascript", "api-discovery", "web-intelligence", "arjun", "ffuf", "access-checks"}
 DESCRIPTIONS = {
  "dns":"Collect DNS records", "subdomains":"Enumerate passive subdomains", "dnsx":"Resolve discovered names", "tls":"Collect TLS metadata", "httpx":"Identify HTTP origins", "screenshots":"Capture visual evidence", "ports":"Discover ports", "crawl":"Crawl live applications", "archives":"Collect archived URLs", "corpus":"Normalize and deduplicate URLs", "javascript":"Preserve and inspect JavaScript", "api-discovery":"Read-only API and identity probes", "web-intelligence":"Collect web metadata", "arjun":"Discover parameters", "nmap":"Validate exposed services", "ffuf":"Discover content", "access-checks":"Read-only access differentials", "report":"Publish reports"}
+# Which stage reads which producer's artifact, at artifact granularity.
+#
+# This is the single source of truth for the data flow. DEPS is derived from it, and a consumer
+# that ran without one of its inputs says so. It exists because the dependency metadata had
+# drifted from reality: access-checks reads four producers, not one, so --list-stages and every
+# report understated the graph, and a run started with --from access-checks produced a clean
+# "0 candidates" with nothing indicating its inputs had never been generated. That is the worst
+# shape a false negative can take - it looks like a result rather than an absence of one.
+STAGE_INPUTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "screenshots": (("httpx", "normalized.txt"),),
+    "ports": (("dnsx", "normalized.txt"),),
+    "crawl": (("httpx", "normalized.txt"),),
+    "corpus": (("crawl", "normalized.txt"), ("archives", "normalized.txt")),
+    "javascript": (("corpus", "normalized.txt"),),
+    "api-discovery": (("httpx", "normalized.txt"),),
+    "web-intelligence": (("httpx", "normalized.txt"),),
+    "arjun": (("corpus", "normalized.txt"),),
+    "ffuf": (("corpus", "origins.txt"),),
+    "access-checks": (("corpus", "params.txt"), ("corpus", "api.txt"),
+                      ("arjun", "params.txt"), ("ffuf", "paths.txt"),
+                      ("web-intelligence", "endpoints.txt")),
+}
+
+
+def missing_inputs(raw: Path, stage_id: str) -> list[str]:
+    """Declared (producer, artifact) inputs for this stage that are absent or empty."""
+    out: list[str] = []
+    for producer, artifact in STAGE_INPUTS.get(stage_id, ()):
+        path = raw / producer / artifact
+        try:
+            empty = not path.read_text(errors="replace").strip()
+        except OSError:
+            empty = True
+        if empty:
+            out.append(f"{producer}/{artifact}")
+    return out
+
+
 DEPS = {s: ([STAGE_IDS[i-1]] if i else []) for i,s in enumerate(STAGE_IDS)}
 DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archives":["subdomains"],"corpus":["crawl","archives"],"javascript":["corpus"],"api-discovery":["httpx"],"web-intelligence":["httpx"],"arjun":["corpus"],"ffuf":["corpus"],"access-checks":["corpus"],"report":[]})
+# Fold the declared artifact-level inputs into the dependency metadata. Positional neighbours are
+# kept so the graph still reads as a pipeline, but a stage now also lists every producer it
+# actually consumes. Sorted by pipeline position to keep --list-stages readable.
+DEPS={s:sorted(set(v)|{producer for producer,_ in STAGE_INPUTS.get(s,())},
+                key=lambda x:STAGE_IDS.index(x) if x in STAGE_IDS else 99) for s,v in DEPS.items()}
 # Stages with a real implementation: a cmds entry in generic_stage, a method dispatched from
 # execute(), or report generation. Every other stage is routed out of the generic fallback and
 # reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
@@ -1068,7 +1111,9 @@ class Runner:
         finally: conn.close()
     # Signals that describe correct behaviour: recorded, never raised as candidates.
     SUPPRESSED_SIGNALS={"auth_required","public_shared_resource"}
-    ACCESS_CHECK_INPUTS=(("corpus","params.txt"),("corpus","api.txt"),("arjun","params.txt"),("ffuf","paths.txt"),("web-intelligence","endpoints.txt"))
+    # Read from the one table rather than restating it, so the dependency metadata and the
+    # consumer can never disagree about what this stage reads.
+    ACCESS_CHECK_INPUTS=STAGE_INPUTS["access-checks"]
     def access_check_targets(self)->tuple[list[str],list[str]]:
         """Targets from every partition this stage cares about, with provenance.
 
@@ -1092,8 +1137,34 @@ class Runner:
         root=self.raw/st.id; dest=root/"normalized.txt"
         candidates,provenance=self.access_check_targets()
         if not candidates:
-            st.status="skipped"; st.failure_reason="no parameterized or API targets in corpus"
-            st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+            # The absent-input check has to happen here too. This is precisely the path a
+            # --from access-checks run takes, and it is the one where a missing producer is most
+            # likely to be the whole explanation for an empty result.
+            gap=missing_inputs(self.raw,st.id)
+            st.status="skipped"
+            st.failure_reason=("no parameterized or API targets in corpus"
+                               + (f"; {len(gap)} declared input(s) absent or empty ({', '.join(gap)}); "
+                                  "an empty result is not evidence of safety" if gap else ""))
+            st.outputs=[str(dest)]
+            self.write_lines(dest,[])
+            # Written even on the skip path. A missing findings.json is indistinguishable from a
+            # stage that crashed, and this is the run shape where an operator most needs to know
+            # the inputs were never generated.
+            atomic_json(root/"findings.json",{"generated_at":now(),"run_id":self.run_id,"target":self.seed,
+                "skipped":True,"reason":st.failure_reason,
+                "identity_states":[s for s in ("anon","a","b") if s=="anon" or self.identities.get(s)],
+                "targets_considered":0,"targets_probed":0,"candidates":[],
+                "declared_inputs_missing":gap,"inputs_complete":not gap,
+                "suppressed":[],"candidates_flagged":[],
+                "disclaimer":"no verdict was formed: the stage had no candidate targets. A zero-candidate "
+                             "result is not evidence that the endpoint is safe, and is especially not evidence "
+                             "of that when a declared input was never generated."})
+            st.outputs.append(str(root/"findings.json"))
+            if gap:
+                print(f"[access-checks] WARNING: {len(gap)} declared input(s) absent or empty: "
+                      f"{', '.join(gap)}; an empty result is not evidence of safety",
+                      file=sys.stderr,flush=True)
+            return
         cap=int(getattr(self.args,"access_checks_max",0) or ACCESS_CHECKS_DEFAULT_MAX)
         targets=candidates[:cap]; refused_scope=[u for u in candidates[cap:]]
         if not self.identities.get("a"):
@@ -1103,6 +1174,14 @@ class Runner:
             self.write_lines(dest,targets); st.processed=len(targets); st.outputs=[str(dest)]; return
         root.mkdir(parents=True,exist_ok=True)
         self.write_lines(root/"inputs.txt",targets)
+        absent_inputs=missing_inputs(self.raw,st.id)
+        if absent_inputs:
+            # Recorded before any verdict, so a zero-candidate result is distinguishable from the
+            # inputs never having been generated. A run resumed with --from access-checks, or one
+            # where ffuf was skipped or capped to zero, would otherwise report a clean empty result.
+            print(f"[access-checks] WARNING: {len(absent_inputs)} declared input(s) absent or empty: "
+                  f"{', '.join(absent_inputs)}; a zero-candidate result is not evidence of safety",
+                  file=sys.stderr,flush=True)
         states_available=[s for s in ("anon","a","b") if s=="anon" or self.identities.get(s)]
         findings:list[dict[str,Any]]=[]; rows:list[str]=[]; refused:list[str]=[]
         for url in targets:
@@ -1141,10 +1220,17 @@ class Runner:
             "identity_states":states_available,"targets_considered":len(targets),"targets_probed":st.processed,
             "candidates":candidates,"candidates_not_probed":len(candidates)-len(targets),
             "refused_out_of_scope":sorted(set(refused)),"suppressed":suppressed,"candidates_flagged":real,
+            "declared_inputs_missing":absent_inputs,"inputs_complete":not absent_inputs,
             "disclaimer":"candidates only; none of these is a validated vulnerability. Two authenticated identities returning an identical body is the precondition for IDOR, not proof. Confirm the identities are distinct accounts and that the object is meant to be private before reporting."})
         st.outputs=[str(dest),str(root/"anomalies.tsv"),str(root/"findings.json"),str(root/"suppressed.tsv"),str(root/"refused.txt")]
         print(f"[access-checks] {st.processed}/{len(targets)} target(s) probed across {len(states_available)} state(s): {len(real)} candidate(s), {len(suppressed)} suppressed, {len(set(refused))} refused out-of-scope",flush=True)
-        if refused: st.failure_reason=f"{len(set(refused))} out-of-scope target(s) or callback(s) refused"
+        notes=[]
+        if absent_inputs:
+            notes.append(f"{len(absent_inputs)} declared input(s) absent or empty ({', '.join(absent_inputs)}); "
+                         "a zero-candidate result is not evidence of safety")
+        if refused:
+            notes.append(f"{len(set(refused))} out-of-scope target(s) or callback(s) refused")
+        if notes: st.failure_reason="; ".join(notes)
         if not real: st.status="completed"
     def web_intelligence_stage(self,st:StageState,deadline:float)->None:
         """Per-page intelligence: endpoints a page calls but never links, comments, headers, tech.

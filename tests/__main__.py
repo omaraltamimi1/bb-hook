@@ -71,10 +71,12 @@ def load_tests(loader,tests,pattern):
  import tests.access_matrix as access_matrix
  import tests.web_intelligence as web_intelligence
  import tests.reporting as reporting
+ import tests.dag_consistency as dag_consistency
  tests.addTests(loader.loadTestsFromModule(stage_coverage))
  tests.addTests(loader.loadTestsFromModule(access_matrix))
  tests.addTests(loader.loadTestsFromModule(web_intelligence))
  tests.addTests(loader.loadTestsFromModule(reporting))
+ tests.addTests(loader.loadTestsFromModule(dag_consistency))
  return tests
 
 if __name__=='__main__':unittest.main(verbosity=2)
