@@ -543,6 +543,44 @@ def ffuf_wordlist(preferred: str | None = None) -> str | None:
     return None
 
 
+def limit_values(values:list[Any],maximum:int)->list[Any]: return values if maximum==0 else values[:maximum]
+
+def resolve_tool(name:str)->str|None:
+    """
+    Locate an external tool, refusing the impostor.
+
+    Debian ships an `httpx` package that is a completely unrelated program to ProjectDiscovery's
+    httpx, and it installs to /usr/bin/httpx. Resolving with a bare shutil.which on a Debian-based
+    host therefore runs the wrong binary: it exits 0 and reports nothing, so the stage records an
+    empty result that reads exactly like "this target has no live hosts". Nothing downstream can tell
+    the difference, which makes it the worst kind of zero.
+
+    The Go tool directories win outright, and the distro path is rejected rather than accepted as a
+    fallback. Returning None means the stage reports a missing tool, which is true, instead of
+    silently running the wrong one.
+    """
+    if name=="httpx":
+        for candidate in (Path.home()/"go"/"bin"/name,Path.home()/".pdtm"/"go"/"bin"/name):
+            if candidate.is_file() and os.access(candidate,os.X_OK): return str(candidate)
+        found=shutil.which(name)
+        return None if found and Path(found).parent in {Path("/usr/bin"),Path("/usr/local/bin")} else found
+    return shutil.which(name)
+
+def parse_port_target(value:str)->tuple[str,int]|None:
+    """Parse "host:port" or a URL into (host, port), or None if there is no port to work with.
+
+    Ports arrive from three shapes depending on which stage produced them: naabu's "h:p", a
+    normalized URL, and a bare host. A bare host is deliberately None: a port stage cannot scan
+    something it does not know the port of, and guessing 80 or 443 would put a request on the wire
+    that nothing asked for.
+    """
+    raw=value.strip()
+    try:
+        if "://" in raw:
+            parsed=urlsplit(raw); return (parsed.hostname,parsed.port) if parsed.hostname and parsed.port else None
+        parsed=urlsplit("//"+raw); return (parsed.hostname,parsed.port) if parsed.hostname and parsed.port else None
+    except ValueError:return None
+
 def naabu_open_ports(payload: str) -> dict[str, list[int]]:
     """
     Parse naabu's -list output into {host: [port, ...]}.
@@ -1409,45 +1447,95 @@ class Runner:
         root=self.raw/st.id; dest=root/"normalized.txt"; st.outputs=[str(dest)]
         if not hosts:
             st.status="skipped"; st.failure_reason="empty input"; self.write_lines(dest,[]); return
-        naabu=shutil.which("naabu")
+        naabu=resolve_tool("naabu")
         if not naabu:
             st.status="skipped"; st.failure_reason="missing external tool: naabu"; self.write_lines(dest,[]); return
         if self.args.dry_run: self.write_lines(dest,hosts); st.processed=st.total; return
         root.mkdir(parents=True,exist_ok=True)
-        input_file=root/"inputs.txt"; self.write_lines(input_file,hosts)
-        raw=root/"stdout.txt"
-        rc=self.command(st.id,[naabu,"-silent","-list",str(input_file)],hosts[0],deadline,raw); st.exit_code=rc
-        opened=naabu_open_ports(raw.read_text(errors="replace") if raw.exists() else "")
-        self.write_lines(dest,[f"{h}:{p}" for h,ports in opened.items() for p in ports])
-        st.processed=st.total
-        if rc and not opened:
-            st.status="failed"; st.failure_reason=f"naabu exited {rc} and reported no open ports"; return
-        if not getattr(self.args,"port_services",False):
-            return
+        # naabu runs in chunks. command() caps every single invocation at start+tool_timeout, so one
+        # invocation covering every host makes the host count a run can port-scan a function of
+        # tool_timeout instead of stage_timeout. On a 90-host target at rate 5 that is a guaranteed
+        # rc=124 with zero hosts scanned, staged as nothing and reported as a hard failure - a run
+        # that reads like "no open ports" when it never got to ask. A chunk that is killed no longer
+        # discards the chunks before it.
+        chunk=max(1,int(getattr(self.args,"ports_chunk",0) or 25))
+        chunks=[hosts[i:i+chunk] for i in range(0,len(hosts),chunk)]
+        opened:dict[str,list[int]]={}; failures:list[str]=[]
+        for index,group in enumerate(chunks,1):
+            self.check(deadline)
+            input_file=root/f"inputs-{index:04d}.txt"; self.write_lines(input_file,group)
+            raw=root/f"naabu-{index:04d}.txt"
+            rc=self.command(st.id,[naabu,"-silent","-list",str(input_file)],group[0],deadline,raw)
+            st.processed+=len(group)
+            if rc: failures.append(f"naabu chunk {index}/{len(chunks)} ({len(group)} host(s)) exited {rc}")
+            for host,ports in naabu_open_ports(raw.read_text(errors="replace") if raw.exists() else "").items():
+                opened[host]=sorted(set(opened.get(host,[]))|set(ports))
+        self.write_lines(dest,[f"{h}:{p}" for h,ports in sorted(opened.items()) for p in ports])
+        if failures: st.exit_code=1
         if not opened:
-            st.status="partial"; st.failure_reason="service detection requested but naabu confirmed no open port to scan"; return
-        nmap=shutil.which("nmap")
+            if failures: st.status="failed"; st.failure_reason="; ".join(failures)+"; no open port was confirmed on any host"
+            return
+        if not getattr(self.args,"port_services",False):
+            if failures: st.status="partial"; st.failure_reason="; ".join(failures)
+            return
+        # A chunk that failed is recorded even when the survivors carry the stage through, because
+        # exit_code alone is invisible in result.txt and "ports completed" over a partial sweep is the
+        # exact silent zero this stage is supposed to stop producing.
+        if failures: st.status="partial"; st.failure_reason="; ".join(failures)
+        # Service detection is the expensive half, so it is what gets ranked and capped; naabu is
+        # cheap and stays uncapped. A host exposing an unusual port is more worth a -sV probe than one
+        # serving only 80 and 443. The cap is announced and the remainder written out, never applied
+        # silently, because a fingerprint count that quietly excludes half the hosts reads as coverage.
+        def rank(item:tuple[str,list[int]])->tuple[int,str]:
+            host,ports=item; return (-len(set(ports)&UNUSUAL_PORTS),host)
+        ranked=sorted(opened.items(),key=rank)
+        cap=int(getattr(self.args,"ports_max_hosts",0) or 0)
+        selected=limit_values(ranked,cap)
+        uncapped=[host for host,_ in ranked[cap:]] if cap and len(ranked)>cap else []
+        if uncapped:
+            self.write_lines(root/"not-fingerprinted.txt",uncapped)
+            print(f"[{st.id}] --ports-max-hosts {cap}: fingerprinting {cap} of {len(ranked)} host(s) with an open port; "
+                  f"{len(uncapped)} with fewer unusual ports are listed in {root/'not-fingerprinted.txt'}",flush=True)
+        intensity=int(getattr(self.args,"nmap_version_intensity",0) or 0)
+        if not selected:
+            st.status="partial" if failures else "completed"
+            if failures: st.failure_reason="; ".join(failures)
+            return
+        nmap=resolve_tool("nmap")
         if not nmap:
             st.status="partial"; st.failure_reason="service detection requested but missing external tool: nmap"; return
         services=[]; refused=[]
-        for host,ports in opened.items():
+        for host,ports in selected:
             self.check(deadline)
             if time.monotonic()>=deadline:
-                st.status="partial"; st.failure_reason="stage deadline reached before every host was fingerprinted"; break
+                st.status="partial"
+                st.failure_reason=("; ".join([st.failure_reason] if st.failure_reason else [])+
+                    ["stage deadline reached before every host was fingerprinted"]).strip("; ")
+                break
             if not self.scope.decide(host if "://" in host else f"http://{host}")[0]:
                 refused.append(host); continue
             xml_out=root/(re.sub(r"[^A-Za-z0-9]+","_",host)+".nmap.xml")
-            # -p is passed the exact ports naabu already confirmed, so nmap cannot widen the scan
-            # on its own; -Pn skips host discovery because naabu proved the host is up; -T4 is the
-            # fastest sane template; -sV/-sC are what the opt-in is for.
-            cmd=[nmap,"-sV","-sC","-Pn","-T4","-p",",".join(str(x) for x in ports),"-oX",str(xml_out),host]
+            # -p carries only ports naabu already confirmed, so nmap cannot widen the scan on its
+            # own; -Pn skips host discovery because naabu proved the host is up; -T4 is the fastest
+            # sane template; -sV/-sC are what the opt-in is for. Unusual ports lead the list, because
+            # that is the reason to spend a version probe on this host rather than on the next one.
+            # Unusual ports lead, but nothing confirmed is dropped. Taking only the unusual ports
+            # whenever any exist is the v8.1.0 behaviour and it is wrong: a host on 22, 80 and 443
+            # would be fingerprinted on 22 alone, so the web service - the thing service detection
+            # exists to identify - never gets a banner.
+            preferred=sorted(ports,key=lambda port:(port not in UNUSUAL_PORTS,port))
+            cmd=[nmap,"-sV","-sC","-Pn","-T4"]
+            if intensity: cmd+=["--version-intensity",str(intensity)]
+            cmd+=["-p",",".join(str(x) for x in preferred),"-oX",str(xml_out),host]
             rc2=self.command(f"{st.id}-services",cmd,host,deadline,root/"services-stdout.txt")
             if rc2: st.exit_code=rc2
             services.extend(nmap_services(xml_out.read_text(errors="replace") if xml_out.exists() else ""))
         if refused: self.write_lines(root/"refused.txt",refused)
         atomic_json(root/"services.json",{"generated_at":now(),"run_id":self.run_id,
             "nmap_flags":"-sV -sC -Pn -T4","scan_scope":"ports confirmed open by naabu only",
-            "hosts_fingerprinted":len(opened)-len(refused),"hosts_refused":refused,"services":services,
+            "hosts_with_open_ports":len(opened),"hosts_fingerprinted":len(selected)-len(refused),
+            "hosts_refused":refused,"not_fingerprinted":uncapped,"fingerprint_cap":cap or None,
+            "nmap_version_intensity":intensity or None,"services":services,
             "disclaimer":"service and version banners are fingerprinting data, not vulnerabilities. A banner exposes software and version; a finding requires a demonstrated weakness in that version."})
         self.write_lines(root/"services.tsv",[f"{r['host']}\t{r['port']}\t{r['protocol']}\t{r['service']}\t{r['product']}\t{r['version']}" for r in services])
         st.outputs.append(str(root/"services.json"))
@@ -1747,7 +1835,8 @@ class Runner:
                      "--global-timeout","--crawl-depth","--max-hosts","--concurrency","--kill-grace",
                      "--heartbeat","--access-checks-max","--arjun-max","--arjun-delay","--web-intel-max",
                      "--ffuf-max-hosts","--ffuf-max-time","--ffuf-threads","--ffuf-delay",
-                     "--ffuf-recursion-depth"):
+                     "--ffuf-recursion-depth","--ports-chunk","--ports-max-hosts",
+                     "--nmap-version-intensity"):
             value=getattr(a,flag.lstrip("-").replace("-","_"),None)
             if value: parts+=[flag,str(value)]
         for flag in ("--strict-scope","--strict-stages","--active","--passive","--port-services",
