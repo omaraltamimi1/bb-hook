@@ -1154,7 +1154,7 @@ class Runner:
             elif st.id=="web-intelligence": self.web_intelligence_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume=("completed artifacts reusable"+(f"; {st.resume}" if (st.resume or "").startswith("invalidated") else ""))
-        except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
+        except (Deadline,concurrent.futures.TimeoutError): st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
         except Interrupted: st.status="interrupted"; st.exit_code=130; st.failure_reason="signal received"; st.resume="retry remaining units"; raise
         except Exception as e:
             st.status="partial" if st.processed else "failed"; st.exit_code=1

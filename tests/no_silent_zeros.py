@@ -151,12 +151,75 @@ class TestPartialWorkSurvivesInterruption(unittest.TestCase):
         interrupt it is the deadline, and execute() turns Deadline into a partial status rather than
         letting it out.
         """
-        self.run.args.stage_timeout = 0.01
-        self.run.args.tool_timeout = 0.01
+        # A socket that accepts and then never answers, so the probe blocks until the deadline
+        # rather than finishing quickly. Racing a real timeout against a real network is what made
+        # this flaky: on a fast run both origins completed and the stage finished cleanly, which is a
+        # different test entirely.
+        import socket
+        import threading
+        from http.server import BaseHTTPRequestHandler
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        held = []
+
+        def drain():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                held.append(conn)          # accepted, never answered
+        thread = threading.Thread(target=drain, daemon=True)
+        thread.start()
+
+        def cleanup():
+            listener.close()
+            for conn in held:
+                conn.close()
+        self.addCleanup(cleanup)
+        # One origin answers, the other hangs. A single origin that only ever blocks leaves processed
+        # at 0, which is a *failed* stage, and the test would be asserting on the wrong status while
+        # measuring the same thing. Answering first is also the case that matters: it is the finished
+        # origin whose evidence must already be on disk when the deadline takes the second.
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/hang"):
+                    import time
+                    time.sleep(5)
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        import socketserver
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        live = server.server_address[1]
+        self.run.inputs = lambda sid: [f"http://127.0.0.1:{live}/openapi.json",
+                                       f"http://127.0.0.1:{port}/hang"]
+        # request_timeout is held well above stage_timeout on purpose. With both in the same range the
+        # socket timeout sometimes fired first, and a socket timeout is an OSError with its own
+        # message - the stage then failed with "TimeoutError" instead of the stage deadline, and the
+        # assertion was really about which of two timeouts won a race. Only the stage deadline should
+        # be able to end this stage.
+        self.run.args.request_timeout = 30.0
+        self.run.args.stage_timeout = 1.0
+        self.run.args.tool_timeout = 30.0
         self.run.execute(self.st)
-        self.assertIn(self.st.status, ("partial", "failed"),
-                      "the stage was not interrupted as intended")
-        self.assertEqual(self.st.failure_reason, "stage deadline expired")
+        self.assertEqual(self.st.status, "partial", "the stage was not interrupted as intended")
+        # Not "TimeoutError: ". A worker that outlives its budget is a deadline, and saying so is the
+        # difference between an operator knowing the run ran out of time and one reading an opaque
+        # exception with an empty message.
+        self.assertEqual(self.st.failure_reason, "stage deadline expired",
+                         "a stage that ran out of time did not say so")
         path = Path(self.run.raw) / "api-discovery" / "metrics.jsonl"
         self.assertTrue(path.exists(),
                         "metrics.jsonl did not exist until the stage finished; a killed stage loses it")
