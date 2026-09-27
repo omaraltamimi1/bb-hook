@@ -142,13 +142,13 @@ class Runner:
         except (ProcessLookupError,subprocess.TimeoutExpired):
             try: os.killpg(p.pid,signal.SIGKILL)
             except ProcessLookupError: pass
-    def command(self,stage:str,cmd:list[str],target:str,deadline:float,output:Path)->int:
+    def command(self,stage:str,cmd:list[str],target:str,deadline:float,output:Path,cwd:Path|None=None)->int:
         rec={"timestamp":now(),"stage":stage,"command":cmd,"target":target,"dry_run":self.args.dry_run}
         with self.command_log.open("a") as f:f.write(json.dumps(rec)+"\n")
         if self.args.dry_run: print("[dry-run]",subprocess.list2cmdline(cmd)); return 0
         err=self.raw/stage/(output.name+".stderr"); err.parent.mkdir(parents=True,exist_ok=True); output.parent.mkdir(parents=True,exist_ok=True)
         with output.open("a") as out,err.open("a") as ef:
-            p=subprocess.Popen(cmd,stdout=out,stderr=ef,text=True,start_new_session=True); self.child=p; start=time.monotonic(); next_beat=start
+            p=subprocess.Popen(cmd,stdout=out,stderr=ef,text=True,start_new_session=True,cwd=str(cwd) if cwd else None); self.child=p; start=time.monotonic(); next_beat=start
             try:
                 while p.poll() is None:
                     self.check(min(deadline,start+self.args.tool_timeout))
@@ -189,6 +189,7 @@ class Runner:
         try:
             if st.id=="report": self.generate_reports(0)
             elif st.id=="api-discovery": self.api_stage(st,deadline)
+            elif st.id=="screenshots": self.screenshot_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -223,6 +224,29 @@ class Runner:
         else:
             # Complex active integrations retain a deterministic candidate list for explicit operator/tool follow-up.
             for i,v in enumerate(values,1): self.check(deadline); self.log_scope(v); self.write_lines(dest,[v]); st.processed=i; print(f"[{st.id}] {i}/{st.total} {v} | elapsed={fmt(time.monotonic()-(deadline-self.args.stage_timeout))}",flush=True)
+    def screenshot_stage(self,st:StageState,deadline:float)->None:
+        values=[v for v in self.inputs(st.id) if v]; dest=self.raw/st.id/"normalized.txt"; st.total=len(values); st.inputs=values; st.outputs=[str(dest)]
+        if not values: st.status="skipped"; st.failure_reason="no live HTTP origins from httpx"; return
+        if self.args.dry_run: self.write_lines(dest,values); st.processed=st.total; return
+        tool=shutil.which("httpx")
+        if not tool: st.status="skipped"; st.failure_reason="missing external tool: httpx"; return
+        root=self.raw/st.id; root.mkdir(parents=True,exist_ok=True)
+        input_file=root/"inputs.txt"; self.write_lines(input_file,values)
+        browser=next((c for c in ("chromium","chromium-browser","google-chrome","google-chrome-stable") if shutil.which(c)),None)
+        shot_timeout=max(5,int(self.args.request_timeout))
+        cmd=[tool,"-silent","-l",str(input_file),"-screenshot","-screenshot-timeout",str(shot_timeout),"-threads",str(max(1,self.args.concurrency)),"-no-color"]
+        if browser: cmd+=["-system-chrome"]
+        else: cmd+=["-no-screenshot-full-page"]
+        stdout=root/"stdout.txt"; rc=self.command(st.id,cmd,self.host,deadline,stdout,cwd=root); st.exit_code=rc
+        shots=sorted(str(p) for p in root.rglob("*.png"))
+        if not shots:
+            st.status="skipped"; st.processed=0
+            st.failure_reason="no screenshot captured" + ("" if browser else " and no local chrome/chromium found for -system-chrome")
+            if rc: st.failure_reason+=f"; httpx exited {rc}"
+            return
+        self.write_lines(dest,shots); st.outputs=[str(p) for p in shots[:200]]+[str(root)]
+        st.processed=len(shots); print(f"[screenshots] captured {len(shots)} image(s) under {root}",flush=True)
+        if rc: st.status="partial"; st.failure_reason=f"httpx exited {rc} but {len(shots)} image(s) were captured"
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
