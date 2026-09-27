@@ -20,7 +20,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 STATUSES = {"pending", "running", "completed", "partial", "failed", "skipped", "interrupted", "unimplemented"}
 STAGE_IDS = ["dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports", "crawl", "archives", "corpus", "javascript", "api-discovery", "web-intelligence", "arjun", "nmap", "ffuf", "access-checks", "report"]
@@ -33,7 +33,7 @@ DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archive
 # execute(), or report generation. Every other stage is routed out of the generic fallback and
 # reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
 # added stage cannot escape classification.
-STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "api-discovery", "javascript", "report"}
+STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "api-discovery", "javascript", "report"}
 UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
 assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
 
@@ -61,6 +61,94 @@ def source_map_refs(text: str) -> list[str]:
         if ref and ref not in refs:
             refs.append(ref)
     return refs
+
+
+CORPUS_JS_EXTS = (".js", ".mjs")
+CORPUS_STATIC_EXTS = (".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff",
+                      ".woff", ".woff2", ".ttf", ".eot", ".otf", ".mp4", ".webm", ".mp3", ".wav", ".avi",
+                      ".mov", ".zip", ".gz", ".tar", ".rar", ".7z", ".pdf", ".doc", ".docx", ".xls",
+                      ".xlsx", ".ppt", ".pptx", ".csv", ".rss", ".atom")
+CORPUS_API_HINTS = ("/api", "/v1", "/v2", "/v3", "/graphql", "/graphiql", "/rest", "/rpc", "/json",
+                    "/service", "/internal", "/admin", "/swagger", "/openapi", "/.well-known", "/oauth",
+                    "/token", "/auth", "/webhook", "/callback", "/ws", "/socket.io")
+ID_SEGMENT_RE = re.compile(r"^(?:\d+|[0-9a-f]{16,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{4,})$", re.IGNORECASE)
+ID_PARAM_RE = re.compile(r"(?:^|[?&#])(?:id|uuid|guid|key|code|token|no|num|number|ref|q|search)$", re.IGNORECASE)
+
+
+def canonical_url(raw: str) -> str | None:
+    """
+    Canonicalise a discovered URL for the corpus.
+
+    Wraps normalize_url (lowercase scheme and host, drop default port, drop
+    fragment) and adds path tidying: collapse repeated slashes, resolve '.' and
+    '..' segments, strip a trailing slash except at the root, and sort query
+    parameters so ?a=1&b=2 and ?b=2&a=1 collapse to one entry.
+
+    The query is left untouched when it does not parse cleanly, because
+    re-encoding an odd query can change what the endpoint actually does.
+    Returns None when the value is not a usable HTTP(S) URL.
+    """
+    try:
+        u = urlsplit(normalize_url(raw))
+    except ValueError:
+        return None
+    if not u.hostname:
+        return None
+    segments: list[str] = []
+    for segment in u.path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    path = "/" + "/".join(segments)
+    query = u.query
+    if query:
+        try:
+            pairs = parse_qsl(query, keep_blank_values=True)
+            if pairs and all(key for key, _ in pairs):
+                query = urlencode(sorted(pairs), doseq=False)
+        except ValueError:
+            pass
+    return urlunsplit((u.scheme.lower(), u.netloc.lower(), path, query, ""))
+
+
+def is_static_url(value: str) -> bool:
+    try:
+        return urlsplit(value).path.lower().endswith(CORPUS_STATIC_EXTS)
+    except ValueError:
+        return False
+
+
+def is_api_url(value: str) -> bool:
+    try:
+        u = urlsplit(value)
+    except ValueError:
+        return False
+    path = u.path.lower()
+    if path.endswith((".json", ".xml", ".graphql")):
+        return True
+    if u.query and any(h in u.query.lower() for h in ("api", "format=json", "callback", "jsonp")):
+        return True
+    return any(h in path for h in CORPUS_API_HINTS)
+
+
+def has_parameters(value: str) -> bool:
+    """True when the URL carries a query parameter or an id-like path segment."""
+    try:
+        u = urlsplit(value)
+    except ValueError:
+        return False
+    if u.query:
+        for pair in u.query.split("&"):
+            if not pair:
+                continue
+            key, _, _val = pair.partition("=")
+            if key and (("=" in pair) or ID_PARAM_RE.search("?" + key)):
+                return True
+    return any(ID_SEGMENT_RE.match(segment) for segment in u.path.split("/") if segment)
 
 
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -222,6 +310,7 @@ class Runner:
             if st.id=="report": self.generate_reports(0)
             elif st.id=="api-discovery": self.api_stage(st,deadline)
             elif st.id=="javascript": self.javascript_stage(st,deadline)
+            elif st.id=="corpus": self.corpus_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -321,6 +410,46 @@ class Runner:
         print(f"[javascript] {st.processed}/{st.total} bundle(s), {len(set(maps))} source map(s)",flush=True)
         if st.processed<st.total:
             st.status="partial"; st.failure_reason=f"{st.total-st.processed} bundle(s) did not complete"
+    def corpus_stage(self,st:StageState,deadline:float)->None:
+        raw_inputs=self.inputs(st.id); root=self.raw/st.id
+        dest=root/"normalized.txt"; st.total=len(raw_inputs); st.inputs=[str(x) for x in raw_inputs]
+        canonical:dict[str,str]={}
+        for value in raw_inputs:
+            self.check(deadline)
+            if not isinstance(value,str): continue
+            for candidate in (value.strip(), *value.split()):
+                if not candidate: continue
+                url=canonical_url(candidate)
+                if not url: continue
+                if not self.scope.decide(url)[0]: continue
+                canonical[url]=url
+                break
+        if not canonical:
+            st.status="skipped"; st.failure_reason="no in-scope HTTP URLs from crawl/archives"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+        if self.args.dry_run:
+            self.write_lines(dest,sorted(canonical)); st.processed=st.total
+            st.outputs=[str(dest)]; return
+        root.mkdir(parents=True,exist_ok=True)
+        signal=sorted(canonical); static=[u for u in signal if is_static_url(u)]
+        signal=[u for u in signal if u not in set(static)]
+        javascript=[u for u in signal if urlsplit(u).path.lower().endswith(CORPUS_JS_EXTS)]
+        api=[u for u in signal if is_api_url(u)]
+        params=[u for u in signal if has_parameters(u)]
+        plain=[u for u in signal if not is_api_url(u) and not has_parameters(u) and not urlsplit(u).path.lower().endswith(CORPUS_JS_EXTS)]
+        self.write_lines(dest,signal)
+        self.write_lines(root/"javascript.txt",javascript)
+        self.write_lines(root/"api.txt",api)
+        self.write_lines(root/"params.txt",params)
+        self.write_lines(root/"static.txt",static)
+        self.write_lines(root/"plain.txt",plain)
+        self.write_lines(root/"origins.txt",unique_origins(signal))
+        self.write_lines(root/"classify.tsv",[f"{kind}\t{len(items)}\t{path}" for kind,items,path in
+            (("javascript",javascript,"javascript.txt"),("api",api,"api.txt"),("params",params,"params.txt"),
+             ("plain",plain,"plain.txt"),("static",static,"static.txt"))])
+        st.outputs=[str(p) for p in (dest,root/"javascript.txt",root/"api.txt",root/"params.txt",root/"plain.txt",root/"static.txt",root/"origins.txt",root/"classify.tsv")]
+        st.processed=st.total
+        print(f"[corpus] {len(signal)} canonical URL(s): {len(javascript)} js, {len(api)} api, {len(params)} parameterized, {len(plain)} plain, {len(static)} static excluded",flush=True)
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
