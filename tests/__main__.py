@@ -76,6 +76,7 @@ def load_tests(loader,tests,pattern):
  import tests.end_to_end as end_to_end
  import tests.ports as ports
  import tests.no_silent_zeros as no_silent_zeros
+ import tests.preflight as preflight
  import tests.profiles as profiles
  tests.addTests(loader.loadTestsFromModule(stage_coverage))
  tests.addTests(loader.loadTestsFromModule(access_matrix))
@@ -86,6 +87,7 @@ def load_tests(loader,tests,pattern):
  tests.addTests(loader.loadTestsFromModule(end_to_end))
  tests.addTests(loader.loadTestsFromModule(ports))
  tests.addTests(loader.loadTestsFromModule(no_silent_zeros))
+ tests.addTests(loader.loadTestsFromModule(preflight))
  tests.addTests(loader.loadTestsFromModule(profiles))
  return tests
 
