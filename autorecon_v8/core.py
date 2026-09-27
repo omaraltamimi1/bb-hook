@@ -2112,12 +2112,10 @@ class Runner:
         """
         One clean human-readable result.txt: the file a human reads to decide what to chase.
 
-        One file, written to the run directory. A second copy is made only when the operator names a
-        directory with --share-dir; the evidence mount used to be mirrored unconditionally, which is
-        how runs nobody asked put files in /mnt/KaliShare. Re-writing is skipped when the file is
-        already byte-identical, so the same report is not announced twice in one run. Only non-empty
-        sections appear, so an empty section never implies a finding that was not there. Everything
-        in it is a candidate, never a validated vulnerability.
+        One file per run, written to the run directory and collected onto the evidence mount.
+        The run-directory copy is what --resume reads; the share copy is the operator's collected
+        result. Only non-empty sections appear, so an empty section never implies a finding that
+        was not there. Everything in it is a candidate, never a validated vulnerability.
         """
         sep="="*72; sep2="-"*72
         def section(title:str,lines:list[str],cap:int=RESULT_SECTION_CAP)->list[str]:
@@ -2213,23 +2211,35 @@ class Runner:
         if run_txt.exists() and run_txt.read_text(errors="replace")==content:
             return run_txt
         atomic_text(run_txt,content)
-        print(f"[report] result.txt -> {run_txt}",flush=True)
         # The shared-evidence copy is opt-in. Writing to the evidence mount by default is what put
         # files in /mnt/KaliShare on a run that was never asked to, so it now requires --share-dir
         # (or an explicit KALI_SHARE_DIR in the environment). One file by default, in the run.
         share_dir=getattr(self.args,"share_dir",None) or os.environ.get("KALI_SHARE_DIR") or None
-        if getattr(self.args,"no_kali_share",False) or not share_dir:
+        # The shared-evidence copy is written by default, because that is where the operator
+        # collects results. I made this opt-in on my own judgement that a run should not write to a
+        # mount it was not explicitly told about, and that broke the collection workflow - the
+        # evidence copy is the point of the mount, not an accident. --no-kali-share still suppresses
+        # it, and --share-dir / KALI_SHARE_DIR still moves it somewhere else.
+        # The duplicate was the real bug and it is fixed at the source: the report is generated once
+        # per run and announced once. One collected file per run is the design, not a side effect of
+        # switching the share off.
+        share_dir=getattr(self.args,"share_dir",None) or os.environ.get("KALI_SHARE_DIR") or None
+        if getattr(self.args,"no_kali_share",False):
+            print(f"[report] result.txt -> {run_txt}  (not collected: --no-kali-share)",flush=True)
             return run_txt
         target=self.kali_share_target(share_dir)
         if target is None:
             # Warned on stderr so it cannot be mistaken for progress, and never raised: a host with
             # no share must behave exactly like one told not to use it.
             warn(f"shared evidence mount {KALI_SHARE_MOUNT} unavailable; result is in {run_txt}")
+            print(f"[report] result.txt -> {run_txt}",flush=True)
             return run_txt
         try:
             target.parent.mkdir(parents=True,exist_ok=True)
             atomic_text(target,content)
-            print(f"[report] result.txt -> {target}",flush=True)
+            # One line, naming the collected copy as the result and disclosing the run copy on the same
+            # line. Announcing each destination separately is what read as "4 result txt" for one scan.
+            print(f"[report] result.txt -> {target}  (run copy: {run_txt})",flush=True)
         except OSError as e:
             # A missing, full or read-only share must never fail a run that already has its result.
             warn(f"shared evidence mount unavailable ({e}); result is in {run_txt}")

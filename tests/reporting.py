@@ -508,45 +508,58 @@ class TestOneResultOneLine(unittest.TestCase):
         self.assertFalse((Path(run.work) / "result.txt").read_text().count("[STAGE SUMMARY]") > 1,
                          "the result contains more than one report body")
 
-    def test_the_evidence_mount_is_not_written_without_being_named(self):
-        """The share copy used to be unconditional, which is how files landed in /mnt/KaliShare on a
-        run that was never asked for it. It now needs --share-dir."""
-        # The share branch has to actually be reachable for this to mean anything, and the test
-        # helper adds --no-kali-share by default, which short-circuits it. The mount constant is
-        # pointed at a real tmpfs mount, so a regression that writes by default writes there and is
-        # caught - and the operator's real share is never the target.
+    def test_the_result_is_collected_onto_the_evidence_mount_by_default(self):
+        """The share is where the operator collects results, so it is written without being asked for.
+
+        I had made this opt-in on my own judgement that a run should not write to a mount nobody
+        named, and that silently broke the collection workflow. The evidence copy is the point of the
+        mount. What was actually wrong was the duplicate announcement, and that is fixed at the
+        source instead: one report per run, announced once.
+        """
         import autorecon_v8.core as core
         real_mount = core.KALI_SHARE_MOUNT
         core.KALI_SHARE_MOUNT = "/dev/shm"
         self.addCleanup(setattr, core, "KALI_SHARE_MOUNT", real_mount)
-        run = build(self.tmp, (), mirror=True)     # mirror=True: no --no-kali-share
+        run = build(self.tmp, (), mirror=True)
         os.environ.pop("KALI_SHARE_DIR", None)
-        before = set()
         mount = Path("/dev/shm") / KALI_SHARE_SUBDIR
         mount.mkdir(parents=True, exist_ok=True)
-        # Compared by name AND mtime, not by name alone. Two runs inside the same second get the same
-        # run id, so a write that overwrites a file an earlier test left behind leaves the name set
-        # identical - and a name-only comparison passed while the regression was live.
-        def snapshot():
-            return {p.name: p.stat().st_mtime_ns for p in mount.iterdir()} if mount.is_dir() else {}
-        # build() runs a CLI dry-run whose own report stage already wrote a result.txt into this run
-        # directory, and write_result_txt skips a rewrite when the file is already byte-identical, so
-        # without this the call returns before it ever reaches the share branch.
         stale = Path(run.work) / "result.txt"
         if stale.exists():
             stale.unlink()
-        before = snapshot()
         run.write_result_txt("ok", "resume", [])
-        after = snapshot()
-        for name in set(after) - set(before):
+        collected = sorted(p for p in mount.iterdir() if run.run_id in p.name)
+        for stray in collected:
+            self.addCleanup(stray.unlink, True)
+        self.assertEqual(len(collected), 1,
+                         f"the run collected {len(collected)} result files on the evidence mount, "
+                         f"expected exactly one: {[str(p) for p in collected]}")
+
+    def test_one_run_collects_one_file_however_many_times_the_report_runs(self):
+        """Reported twice, written once. The name+mtime snapshot is deliberate: two runs in the same
+        second share a run id, so a second write would overwrite the first and a name-only check
+        would never see it."""
+        import autorecon_v8.core as core
+        real_mount = core.KALI_SHARE_MOUNT
+        core.KALI_SHARE_MOUNT = "/dev/shm"
+        self.addCleanup(setattr, core, "KALI_SHARE_MOUNT", real_mount)
+        run = build(self.tmp, (), mirror=True)
+        os.environ.pop("KALI_SHARE_DIR", None)
+        mount = Path("/dev/shm") / KALI_SHARE_SUBDIR
+        mount.mkdir(parents=True, exist_ok=True)
+        stale = Path(run.work) / "result.txt"
+        if stale.exists():
+            stale.unlink()
+        run.write_result_txt("ok", "resume", [])
+        def snapshot():
+            return {p.name: p.stat().st_mtime_ns for p in mount.iterdir() if run.run_id in p.name}
+        first = snapshot()
+        run.write_result_txt("ok", "resume", [])
+        second = snapshot()
+        for name in second:
             self.addCleanup((mount / name).unlink, True)
-        touched = sorted(n for n in set(before) & set(after) if before[n] != after[n])
-        self.assertEqual((set(after) - set(before)), set(),
-                         "a result file appeared on the evidence mount with no --share-dir: "
-                         f"{sorted(set(after) - set(before))}")
-        self.assertEqual(touched, [],
-                         "an existing file on the evidence mount was rewritten with no --share-dir: "
-                         f"{touched}")
+        self.assertEqual(sorted(first), sorted(second))
+        self.assertEqual(len(first), 1, f"expected one collected file, found {sorted(first)}")
 
 
 class TestTheRunAnnouncesItsResultOnce(unittest.TestCase):
@@ -584,6 +597,43 @@ class TestTheRunAnnouncesItsResultOnce(unittest.TestCase):
             announced = [l for l in (r.stdout + r.stderr).splitlines() if "result.txt ->" in l]
             self.assertLessEqual(len(announced), 1,
                                  f"a run that reached the report stage announced {len(announced)} times: {announced}")
+
+
+class TestTheDefaultRunAnnouncesOnce(unittest.TestCase):
+    """The dedup tests above all pass --no-kali-share, so none of them exercised the path a normal run
+    takes: the collected copy. A regression that announced both the collected file and the run copy
+    passed the whole suite, because the only branch under test was the suppressed one."""
+
+    def default_run(self, d):
+        import subprocess
+        # The share root has to be a real mount for the guard to accept it, so /dev/shm rather than a
+        # temp dir - a plain directory is correctly rejected, which is the other half of the guard.
+        env = dict(os.environ, AUTORECON_KALI_SHARE="/dev/shm")
+        r = subprocess.run(
+            ["autorecon", "https://127.0.0.1:1/", "--output-dir", d,
+             "--only", "report", "--global-timeout", "60"],
+            capture_output=True, text=True, env=env, timeout=300)
+        return [l for l in (r.stdout + r.stderr).splitlines() if "result.txt ->" in l]
+
+    def test_a_default_run_announces_exactly_one_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            announced = self.default_run(d)
+            self.assertEqual(len(announced), 1,
+                             f"a default run announced its result {len(announced)} times: {announced}")
+
+    def test_the_collected_file_is_what_gets_announced(self):
+        with tempfile.TemporaryDirectory() as d:
+            announced = self.default_run(d)
+            self.assertEqual(len(announced), 1, f"expected one announcement, got {announced}")
+            line = announced[0]
+            self.assertIn("run copy:", line,
+                          f"the announcement does not disclose the run copy, so the two paths read as "
+                          f"two results again: {line}")
+            collected = line.split("result.txt -> ", 1)[1].split("  (run copy:")[0].strip()
+            self.assertTrue(collected.startswith("/dev/shm/autorecon-results/"),
+                            f"the announced result is not the collected file: {line}")
+            self.assertTrue(os.path.exists(collected), f"the announced file does not exist: {collected}")
+            self.addCleanup(lambda: os.path.exists(collected) and os.unlink(collected))
 
 
 if __name__ == "__main__":
