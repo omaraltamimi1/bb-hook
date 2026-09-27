@@ -323,7 +323,73 @@ class TestMetricsAreFlushedWhileTheStageRuns(unittest.TestCase):
             self.assertIn("status", j.loads(row), f"a metrics row is missing its status: {row}")
 
 
+class TestCrawlDoesNotLoseTheRun(unittest.TestCase):
+    """The whatnot live run: one katana invocation over one seed never returned, produced zero lines,
+    and the stage deadline then took corpus, javascript, arjun, ffuf and access-checks down with it.
+    Five stages lost to one slow host, and the stages that skipped all said why - so the report was
+    honest and still nearly empty."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+
+    def runner(self, seeds):
+        run = build(self.tmp, "crawl")
+        run.inputs = lambda sid, v=list(seeds): list(v)
+        return run
+
+    def stage(self, run):
+        st = StageState(id="crawl", name="crawl", description="", dependencies=[])
+        run.stages = {"crawl": st}
+        run.execute(st)
+        return st
+
+    def test_seeds_are_crawled_one_at_a_time_by_default(self):
+        """The whole point: one host cannot consume the stage's budget on its own."""
+        calls = []
+
+        def spy(stage, cmd, target, deadline, output, cwd=None):
+            calls.append(target)
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Path(output).write_text(f"https://{target}/found\n")
+            return 0
+        run = self.runner(["a.example.com", "b.example.com", "c.example.com"])
+        run.command = spy
+        self.stage(run)
+        self.assertEqual(len(calls), 3, f"expected one invocation per seed, got {len(calls)}")
+
+    def test_a_killed_seed_keeps_the_others(self):
+        def killed(stage, cmd, target, deadline, output, cwd=None):
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            if target == "b.example.com":
+                Path(output).write_text("https://b.example.com/half\n")
+                return 124
+            Path(output).write_text(f"https://{target}/found\n")
+            return 0
+        run = self.runner(["a.example.com", "b.example.com", "c.example.com"])
+        run.command = killed
+        st = self.stage(run)
+        text = (Path(run.work) / "result.txt")
+        kept = (Path(run.raw) / "crawl" / "normalized.txt").read_text()
+        self.assertIn("a.example.com", kept)
+        self.assertIn("c.example.com", kept)
+        self.assertIn("b.example.com/half", kept,
+                      "the killed seed's partial results were discarded")
+        self.assertEqual(st.status, "partial", "a killed seed was reported as a clean stage")
+        self.assertIn("b.example.com", st.failure_reason or "")
+
+    def test_a_slow_seed_cannot_starve_the_rest(self):
+        """The budget is per invocation, so a seed that overruns is bounded to its own unit."""
+        run = self.runner([f"h{i}.example.com" for i in range(20)])
+        run.command = lambda *a, **k: 0
+        st = self.stage(run)
+        self.assertEqual(st.processed, 20,
+                         "a crawl that spawned per-seed invocations did not account for all seeds")
+
+
 if __name__ == "__main__":
+
 
 
     unittest.main(verbosity=2)

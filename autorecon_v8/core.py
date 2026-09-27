@@ -1399,15 +1399,35 @@ class Runner:
             # katana has no -l flag: -u/-list takes targets, and also accepts a file path,
             # which avoids ARG_MAX for large seed sets. -e cdn drops CDN hosts, -duc skips
             # the update check, -nc disables ANSI colouring in the captured stdout.
-            cmd=[tool,"-silent","-u",str(input_file),"-d",str(max(1,self.args.crawl_depth)),
-                 "-c",str(max(1,self.args.concurrency)),"-rl",str(max(1,int(self.args.rate_limit))),
-                 "-timeout",str(max(1,int(self.args.request_timeout))),"-e","cdn","-duc","-nc"]
-            if scope_pattern: cmd+=["-cs",scope_pattern]
-            stdout=root/"katana.txt"
-            rc=self.command(st.id,cmd,self.host,deadline,stdout,cwd=root); st.exit_code=rc
+            # Chunked per seed, for the same reason ports is. One katana invocation over every origin
+            # makes the crawl a function of tool_timeout rather than stage_timeout, and on a live
+            # target it produces exactly what the whatnot run produced: a single invocation that
+            # never returned, zero lines, and a stage deadline that then took corpus, javascript,
+            # arjun, ffuf and access-checks down with it. Five stages lost to one slow host.
+            chunk=max(1,int(getattr(self.args,"crawl_chunk",0) or 1))
+            groups=[seeds[i:i+chunk] for i in range(0,len(seeds),chunk)]
+            discovered=[]; crawl_failures=[]
+            for index,group in enumerate(groups,1):
+                self.check(deadline)
+                # The first chunk keeps the name inputs.txt, which is what the single-invocation path
+                # used, so the existing argv assertion and any operator reading the directory still
+                # find the seed list where they expect it.
+                seed_file=root/("inputs.txt" if index==1 else f"inputs-{index:04d}.txt")
+                self.write_lines(seed_file,group)
+                cmd=[tool,"-silent","-u",str(seed_file),"-d",str(max(1,self.args.crawl_depth)),
+                     "-c",str(max(1,self.args.concurrency)),"-rl",str(max(1,int(self.args.rate_limit))),
+                     "-timeout",str(max(1,int(self.args.request_timeout))),"-e","cdn","-duc","-nc"]
+                if scope_pattern: cmd+=["-cs",scope_pattern]
+                stdout=root/f"katana-{index:04d}.txt"
+                rc=self.command(st.id,cmd,group[0],deadline,stdout,cwd=root)
+                st.processed+=len(group)
+                if rc: crawl_failures.append(f"katana on {group[0]} (chunk {index}/{len(groups)}) exited {rc}")
+                text=stdout.read_text(errors="replace") if stdout.exists() else ""
+                discovered+=[line.strip() for line in text.splitlines()
+                             if line.strip().startswith(("http://","https://"))]
+            rc=1 if crawl_failures else 0; st.exit_code=rc
             engine="katana"
-            lines=stdout.read_text(errors="replace").splitlines() if stdout.exists() else []
-            discovered=[line.strip() for line in lines if line.strip().startswith(("http://","https://"))]
+            if crawl_failures: self.crawl_failures=crawl_failures
         else:
             engine="native"; rc=0
             discovered=self.crawl_native(seeds,deadline,CRAWL_NATIVE_MAX_URLS)
@@ -1419,12 +1439,20 @@ class Runner:
         self.write_lines(dest,kept)
         self.write_lines(root/"dropped-out-of-scope.txt",[u for u in dict.fromkeys(discovered) if u not in set(kept)])
         st.outputs=[str(dest),str(root/"dropped-out-of-scope.txt")]+([str(root/"katana.txt")] if engine=="katana" else [])
-        st.processed=len(kept)
+        # processed counts seeds handed to the crawler, not URLs kept. Overwriting it with the
+        # kept count made a crawl that ran every seed report processed=0, which reads as a stage
+        # that never started.
+        st.processed=len(seeds); st.total=len(seeds)
         print(f"[crawl] {engine}: {len(kept)} in-scope URL(s) from {len(seeds)} seed(s), {dropped} dropped as out-of-scope",flush=True)
         if engine=="native" and not tool:
             st.failure_reason="katana not installed; used the bounded native crawler instead"
         if rc and not kept:
-            st.status="failed"; st.failure_reason=f"{engine} exited {rc} and produced no in-scope URLs"
+            st.status="failed"; st.failure_reason="; ".join(crawl_failures)+"; no in-scope URL was found"
+        elif crawl_failures:
+            # A chunk that timed out is recorded even when the survivors carry the stage, because
+            # "crawl completed" over a partial sweep is what made this run's five downstream stages
+            # skip without saying why.
+            st.status="partial"; st.failure_reason="; ".join(crawl_failures)
     def _probe(self,url:str,headers:dict[str,str],deadline:float)->dict[str,Any]:
         """One read-only GET with an explicit header set. Redirects are never followed."""
         u=urlsplit(url)
