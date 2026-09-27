@@ -126,6 +126,7 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             "/redirect": self.redirect,
             "/api/v1/orders/equal-length": self.equal_length,
             "/api/v1/status-only-enforcement": self.status_only_enforcement,
+            "/app": self.app_page,
         }.get(path)
         if handler is None:
             status, body, headers = _json({"error": "not found"}, 404)
@@ -198,6 +199,19 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             return self._send(*_json(STATUS_ONLY_BODY))
         return self._send(*_json(STATUS_ONLY_BODY, 401))
 
+    def app_page(self, _session, _query):
+        """An HTML page whose endpoints are only discoverable by reading it."""
+        body = APP_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        # A cookie with no Secure and no HttpOnly. Recorded as an observation only: an attribute
+        # weakness is not reportable without a demonstrated theft primitive.
+        self.send_header("Set-Cookie", "session=fixture; Path=/")
+        self.send_header("Content-Security-Policy", "default-src 'self'")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # -- case 5: untrusted_redirect ------------------------------------
     def redirect(self, _session, query):
         """
@@ -208,6 +222,24 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
         if not target:
             return self._send(*_json({"error": "missing to"}, 400))
         return self._send(302, b"", {"Location": target})
+
+
+# A page whose interesting content is only reachable by reading it: the endpoints below are
+# fetched from script or posted to, never linked, so a crawler following href/src misses all of
+# them. One points off-host, which the stage must record without ever fetching.
+APP_HTML = """<!doctype html><html><head><title>Fixture App</title>
+<meta name="generator" content="FixtureCMS 1.2">
+<meta name="description" content="fixture application"></head>
+<body>
+<form action="/api/v1/session" method="post"><input name="user"></form>
+<script>
+fetch('/api/v1/internal/accounts');
+fetch('http://third-party.invalid/collect');
+axios.post("/api/v1/internal/transfer");
+</script>
+<!-- TODO: debug endpoint /api/v1/internal/dump must be removed before release -->
+<!-- layout tweak -->
+</body></html>"""
 
 
 class ExternalServer(http.server.BaseHTTPRequestHandler):
