@@ -265,6 +265,23 @@ def access_signals(states: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     b = states.get("b") or {}
     ok = lambda s: bool(s) and isinstance(s.get("status"), int) and 200 <= s["status"] < 300
 
+    # When anonymous and two distinct authenticated principals all receive byte-identical 2xx
+    # bodies, the endpoint is serving a public representation. The two signals this would
+    # otherwise raise - anon_matches_auth and identical_across_identities, both high severity -
+    # are right when anonymous matches only identity A while A differs from B, because then
+    # anonymous is being handed the privileged user's body. When all three match, raising them
+    # buries a real IDOR under every shared config endpoint on the host, so this case is
+    # classified and suppressed instead.
+    if ("anon" in states and "a" in states and "b" in states
+            and anon.get("status") == a.get("status") == b.get("status")
+            and anon.get("sha256") and anon.get("sha256") == a.get("sha256") == b.get("sha256")):
+        return [{"signal": "public_shared_resource", "severity": "info", "confidence": "n/a",
+                 "false_positive_risk": "none, an identical anonymous response is expected for a public resource",
+                 "detail": f"anonymous, identity-a and identity-b all returned {anon.get('status')} "
+                           f"with the same {anon.get('length')}-byte body",
+                 "verify": "no action; confirm the route is meant to be public, and if it is not then "
+                           "an unauthenticated read is the finding to pursue"}]
+
     if anon and a and anon.get("status") != a.get("status"):
         out.append({"signal": "auth_required", "severity": "info", "confidence": "n/a",
                     "false_positive_risk": "none, this is correct behaviour",
@@ -872,6 +889,8 @@ class Runner:
         except (OSError,http.client.HTTPException) as e:
             return {"status":0,"length":0,"sha256":"","json_keys":[],"stack_trace":False,"location":"","error":f"{type(e).__name__}: {e}"}
         finally: conn.close()
+    # Signals that describe correct behaviour: recorded, never raised as candidates.
+    SUPPRESSED_SIGNALS={"auth_required","public_shared_resource"}
     ACCESS_CHECK_INPUTS=(("corpus","params.txt"),("corpus","api.txt"),("arjun","params.txt"),("ffuf","paths.txt"))
     def access_check_targets(self)->tuple[list[str],list[str]]:
         """Targets from every partition this stage cares about, with provenance.
@@ -930,8 +949,8 @@ class Runner:
                                    +[",".join(s["signal"] for s in signals) or "none"]))
             st.processed+=1
         self.write_lines(dest,rows)
-        suppressed=[f for f in findings if f["signal"]=="auth_required"]
-        real=[f for f in findings if f["signal"]!="auth_required"]
+        suppressed=[f for f in findings if f["signal"] in self.SUPPRESSED_SIGNALS]
+        real=[f for f in findings if f["signal"] not in self.SUPPRESSED_SIGNALS]
         def table(path:Path,header:list[str],rows:list[list[str]])->None:
             # write_lines() sorts and set-dedupes, which would move a header row and drop repeats.
             path.parent.mkdir(parents=True,exist_ok=True)

@@ -68,7 +68,9 @@ def load_tests(loader,tests,pattern):
  # unittest.main() only scans this module's namespace, so a plain import of a sibling test
  # module is not enough to register its cases. load_tests is the supported way to extend the suite.
  import tests.stage_coverage as stage_coverage
+ import tests.access_matrix as access_matrix
  tests.addTests(loader.loadTestsFromModule(stage_coverage))
+ tests.addTests(loader.loadTestsFromModule(access_matrix))
  return tests
 
 if __name__=='__main__':unittest.main(verbosity=2)
