@@ -88,6 +88,40 @@ class TestUnitTiming(unittest.TestCase):
             self.assertEqual(fmt_ms(seconds), fmt(seconds),
                              "a long duration should read the same as it always did")
 
+    def test_a_finished_unit_reports_its_outcome(self):
+        """The heartbeat fires at launch, so a fast unit otherwise reports nothing at all.
+
+        One line reading elapsed=0ms is equally consistent with a fast success, a tool that failed
+        instantly and a unit killed on timeout, and the return code was never printed anywhere. A run
+        against a real host could not answer "did dig actually answer?".
+        """
+        import inspect
+        from autorecon_v8 import core
+        source = inspect.getsource(core.Runner.command)
+        self.assertIn("done rc={rc}", source, "a finished unit does not report its return code")
+        self.assertIn("elapsed={fmt_ms(", source)
+
+    def test_a_real_unit_reports_success_with_a_duration(self):
+        """End to end through the real dig path: rc=0 and a duration above zero."""
+        import io, contextlib, pathlib, shutil, tempfile
+        from autorecon_v8 import core
+        from autorecon_v8.cli import apply_profile_defaults, parser
+        if not shutil.which("dig"):
+            self.skipTest("dig is not installed")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        args = apply_profile_defaults(parser().parse_args(["127.0.0.1", "--output-dir", tmp, "--only", "dns"]))
+        run = core.Runner(args)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run.command("dns", ["dig", "+short", "+time=2", "localhost"], "localhost",
+                             run.started + 30, pathlib.Path(tmp) / "out.txt")
+        self.assertEqual(rc, 0, buf.getvalue())
+        line = [l for l in buf.getvalue().splitlines() if "done rc=" in l]
+        self.assertTrue(line, f"no completion line was printed:\n{buf.getvalue()}")
+        self.assertIn("rc=0", line[-1])
+        self.assertNotIn("elapsed=0ms", line[-1], "a unit that ran reported zero elapsed")
+
     def test_the_heartbeat_line_uses_the_sub_second_formatter(self):
         """Guards the call site, not just the helper."""
         import inspect

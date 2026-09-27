@@ -1,2 +1,16 @@
 __pycache__/
 *.py[cod]
+
+# Local operator tooling, present in the checkout on purpose and never to be committed.
+# .bridge-secret holds the live tunnel secret and .bridge-env the token: both are mode 0600 and
+# untracked, which is one `git add -A` away from being published. Ignore them by name rather than
+# relying on remembering, because the failure is silent and the consequence is not.
+.bridge-env
+.bridge-secret
+bridge-exec
+bridge-status
+sessions-tunnel.log
+shell-bridge.py
+doh-forwarder.py
+autorecon-v8
+*.egg-info/

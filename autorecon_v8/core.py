@@ -866,7 +866,13 @@ class Runner:
                         print(f"[{stage}] tool={cmd[0]} PID={p.pid} target={target} elapsed={fmt_ms(time.monotonic()-start)} deadline={fmt(max(0,min(deadline,start+self.args.tool_timeout)-time.monotonic()))}",flush=True); next_beat=time.monotonic()+min(30,self.args.heartbeat)
                     time.sleep(.1)
                 if self.stop.is_set(): raise Interrupted()
-                return int(p.returncode or 0)
+                rc=int(p.returncode or 0)
+                # The heartbeat above fires at launch, so a unit that finishes in 20ms produces one
+                # line reading 0ms and then nothing. That line is equally consistent with a fast
+                # success, a tool that failed instantly and a unit killed on timeout, and the return
+                # code was never printed at all, so the outcome of a fast unit was invisible.
+                print(f"[{stage}] done rc={rc} elapsed={fmt_ms(time.monotonic()-start)} target={target} tool={cmd[0]}",flush=True)
+                return rc
             except (Interrupted,Deadline): self._terminate(p); raise
             finally:self.child=None
     def write_lines(self,path:Path,values:Iterable[str])->None:
