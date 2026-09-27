@@ -33,7 +33,7 @@ DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archive
 # execute(), or report generation. Every other stage is routed out of the generic fallback and
 # reported as unimplemented instead of silently completing. Derived from STAGE_IDS so a newly
 # added stage cannot escape classification.
-STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "report"}
+STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "access-checks", "report"}
 UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
 assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
 
@@ -192,6 +192,113 @@ def crawl_scope_pattern(hosts: Iterable[str]) -> str | None:
     return "(" + "|".join(re.escape(h) for h in alternatives) + ")"
 
 
+ACCESS_CHECKS_DEFAULT_MAX = 40
+ACCESS_BODY_LIMIT = 512_000
+STACK_TRACE_RE = re.compile(r"(?:Traceback \(most recent call last\)|at [\w.$]+\([^)]*:\d+\)|java\.lang\.|Exception in thread|ORA-\d{5}|SQLSTATE\[|panic:|goroutine \d+ \[)", re.IGNORECASE)
+
+
+def load_credentials(filename: str) -> dict[str, str]:
+    """
+    Read one identity from a file and return the request headers it implies.
+
+    Accepts the shapes an operator actually has to hand: a raw cookie line, a
+    'Cookie: ...' header, a pasted curl command, or a raw 'Authorization: ...'
+    value. Values are used verbatim; nothing is redacted.
+    """
+    path = Path(filename).expanduser()
+    if not path.is_file():
+        raise ValueError(f"credential file does not exist: {path}")
+    raw = path.read_text(errors="replace").strip()
+    if not raw:
+        raise ValueError(f"credential file is empty: {path}")
+    auth = re.search(r"(?im)^\s*Authorization\s*:\s*(.+?)\s*$", raw)
+    if auth:
+        return {"Authorization": auth.group(1).strip().strip("^\"'")}
+    cookie = re.search(r"(?im)\bCookie\s*:\s*([^\r\n]+)", raw)
+    if cookie:
+        return {"Cookie": cookie.group(1).strip().rstrip("^\"'").strip()}
+    curl_b = re.search(r"(?:^|\s)(?:-b|--cookie)\s+['\"]?([^'\"\n]+)", raw)
+    if curl_b:
+        return {"Cookie": curl_b.group(1).strip()}
+    if "\n" in raw or "\r" in raw:
+        raise ValueError("credential file must hold one Cookie header, one Authorization header, a cookie line, or a curl command")
+    if any(char in raw for char in "\r\0"):
+        raise ValueError("invalid credential value")
+    lowered = raw.lower()
+    if lowered.startswith(("bearer ", "basic ", "token ", "digest ")):
+        return {"Authorization": raw}
+    return {"Cookie": raw}
+
+
+def response_signature(status: int, body: bytes, content_type: str = "") -> dict[str, Any]:
+    """Comparable fingerprint of a response: status, length, digest, and JSON shape."""
+    length = len(body or b"")
+    digest = hashlib.sha256(body or b"").hexdigest()
+    keys: list[str] = []
+    if "json" in (content_type or "").lower() or (body or b"")[:1] in (b"{", b"["):
+        try:
+            parsed = json.loads((body or b"").decode("utf-8", "ignore"))
+            if isinstance(parsed, dict):
+                keys = sorted(str(k) for k in parsed)[:64]
+        except (ValueError, TypeError):
+            keys = []
+    return {"status": status, "length": length, "sha256": digest, "json_keys": keys,
+            "stack_trace": bool(STACK_TRACE_RE.search((body or b"").decode("utf-8", "ignore")[:20000]))}
+
+
+def access_signals(states: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Compare per-identity response signatures and emit candidate signals.
+
+    These are CANDIDATES, not findings. Two authenticated identities returning an
+    identical body is the precondition for IDOR, but the tool cannot prove the two
+    identities are different principals, nor that the object is meant to be
+    private. Every signal therefore carries a confidence and an explicit
+    false-positive risk, and each includes the next step a human must take.
+    """
+    out: list[dict[str, Any]] = []
+    anon = states.get("anon") or {}
+    a = states.get("a") or {}
+    b = states.get("b") or {}
+    ok = lambda s: bool(s) and isinstance(s.get("status"), int) and 200 <= s["status"] < 300
+
+    if anon and a and anon.get("status") != a.get("status"):
+        out.append({"signal": "auth_required", "severity": "info", "confidence": "n/a",
+                    "false_positive_risk": "none, this is correct behaviour",
+                    "detail": f"anonymous {anon.get('status')} vs identity-a {a.get('status')}",
+                    "verify": "no action, the endpoint correctly requires authentication"})
+
+    if ok(anon) and ok(a) and anon.get("sha256") == a.get("sha256"):
+        out.append({"signal": "anon_matches_auth", "severity": "high", "confidence": "medium",
+                    "false_positive_risk": "public endpoint, or a cache serving one variant to both",
+                    "detail": "anonymous and authenticated responses are byte-identical",
+                    "verify": "request the same URL with no credentials and confirm the body is the authenticated body, not a public stub"})
+
+    if ok(a) and ok(b):
+        if a.get("sha256") == b.get("sha256") and a.get("status") == b.get("status"):
+            out.append({"signal": "identical_across_identities", "severity": "high", "confidence": "medium",
+                        "false_positive_risk": "the two identities may be the same account, or the object may be public by design",
+                        "detail": f"identity-a and identity-b both returned {a.get('status')} with an identical {a.get('length')}-byte body",
+                        "verify": "confirm a and b are distinct accounts, then swap the object id in the URL between them and confirm b still receives a's object"})
+        elif a.get("length") != b.get("length"):
+            out.append({"signal": "length_differs_across_identities", "severity": "medium", "confidence": "low",
+                        "false_positive_risk": "per-user state such as a name or cart count changes the length legitimately",
+                        "detail": f"identity-a {a.get('length')} bytes vs identity-b {b.get('length')} bytes",
+                        "verify": "diff the two bodies field by field and identify any field that is not the requester's own"})
+        else:
+            out.append({"signal": "same_status_different_content", "severity": "medium", "confidence": "low",
+                        "false_positive_risk": "timestamps, request ids or nonces in the body change the digest",
+                        "detail": "identical status and length but different body digest",
+                        "verify": "diff the bodies and ignore volatile fields before drawing a conclusion"})
+
+    leaked=[label for label,sig in states.items() if sig and sig.get("stack_trace")]
+    if leaked:
+        out.append({"signal": "verbose_error", "severity": "low", "confidence": "medium",
+                    "false_positive_risk": "a generic error page that happens to contain a stack frame in a sample body",
+                    "detail": "stack-trace or exception signature in the response body, seen by: "+",".join(sorted(leaked)),
+                    "verify": "capture the full body and confirm it discloses internal paths, versions or query fragments"})
+    return out
+
 def now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat()
 def atomic_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True); fd,tmp=tempfile.mkstemp(prefix=".state-",dir=path.parent)
@@ -254,6 +361,9 @@ class Deadline(Exception): pass
 class Runner:
     def __init__(self,args:argparse.Namespace):
         self.args=args; self.host,self.seed=normalize_target(args.target); self.stop=threading.Event(); self.child:subprocess.Popen[str]|None=None
+        self.identities={"anon":{},"a":{},"b":{}}
+        if getattr(args,"cookie_file",None): self.identities["a"]=load_credentials(args.cookie_file)
+        if getattr(args,"cookie_file_b",None): self.identities["b"]=load_credentials(args.cookie_file_b)
         self.started=time.monotonic(); self.started_at=now(); self.global_deadline=self.started+args.global_timeout if args.global_timeout else float("inf")
         self.out=Path(args.output_dir).resolve(); self.out.mkdir(parents=True,exist_ok=True); os.chmod(self.out,0o700)
         self.run_id=args.resume if args.resume not in (None,"last") else (self._last_id() if args.resume=="last" else dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")+"-"+hashlib.sha256(self.seed.encode()).hexdigest()[:8])
@@ -353,6 +463,7 @@ class Runner:
             elif st.id=="javascript": self.javascript_stage(st,deadline)
             elif st.id=="corpus": self.corpus_stage(st,deadline)
             elif st.id=="crawl": self.crawl_stage(st,deadline)
+            elif st.id=="access-checks": self.access_checks_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -555,6 +666,91 @@ class Runner:
             st.failure_reason="katana not installed; used the bounded native crawler instead"
         if rc and not kept:
             st.status="failed"; st.failure_reason=f"{engine} exited {rc} and produced no in-scope URLs"
+    def _probe(self,url:str,headers:dict[str,str],deadline:float)->dict[str,Any]:
+        """One read-only GET with an explicit header set. Redirects are never followed."""
+        u=urlsplit(url)
+        if not u.hostname: return {"status":0,"length":0,"sha256":"","json_keys":[],"stack_trace":False,"location":"","error":"no host"}
+        timeout=max(.1,min(self.args.request_timeout,deadline-time.monotonic()))
+        conn=(http.client.HTTPSConnection if u.scheme=="https" else http.client.HTTPConnection)(u.hostname,u.port,timeout=timeout)
+        send={"User-Agent":"AutoRecon/8","Accept":"*/*",**headers}
+        try:
+            conn.request("GET",urlunsplit(("", "",u.path or "/",u.query,"")),headers=send)
+            resp=conn.getresponse(); body=resp.read(ACCESS_BODY_LIMIT)
+            sig=response_signature(resp.status,body,resp.headers.get("Content-Type") or "")
+            sig["location"]=resp.headers.get("Location") or ""
+            return sig
+        except (OSError,http.client.HTTPException) as e:
+            return {"status":0,"length":0,"sha256":"","json_keys":[],"stack_trace":False,"location":"","error":f"{type(e).__name__}: {e}"}
+        finally: conn.close()
+    def access_check_targets(self)->tuple[list[str],list[str]]:
+        """Targets from the corpus partitions this stage cares about, with provenance."""
+        params=[v for v in self.read_partition("params.txt") if v]
+        api=[v for v in self.read_partition("api.txt") if v]
+        ordered:list[str]=[]; seen=set()
+        for url in params+api:
+            if url not in seen: seen.add(url); ordered.append(url)
+        return ordered,["params.txt","api.txt"]
+    def read_partition(self,name:str)->list[str]:
+        p=self.raw/"corpus"/name
+        return [ln.strip() for ln in p.read_text(errors="replace").splitlines() if ln.strip()] if p.exists() else []
+    def access_checks_stage(self,st:StageState,deadline:float)->None:
+        root=self.raw/st.id; dest=root/"normalized.txt"
+        candidates,provenance=self.access_check_targets()
+        if not candidates:
+            st.status="skipped"; st.failure_reason="no parameterized or API targets in corpus"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+        cap=int(getattr(self.args,"access_checks_max",0) or ACCESS_CHECKS_DEFAULT_MAX)
+        targets=candidates[:cap]; refused_scope=[u for u in candidates[cap:]]
+        if not self.identities.get("a"):
+            st.status="skipped"; st.failure_reason="no --cookie-file supplied, so there is no authenticated state to compare against"
+            st.outputs=[str(dest)]; self.write_lines(dest,[]); return
+        if self.args.dry_run:
+            self.write_lines(dest,targets); st.processed=len(targets); st.outputs=[str(dest)]; return
+        root.mkdir(parents=True,exist_ok=True)
+        self.write_lines(root/"inputs.txt",targets)
+        states_available=[s for s in ("anon","a","b") if s=="anon" or self.identities.get(s)]
+        findings:list[dict[str,Any]]=[]; rows:list[str]=[]; refused:list[str]=[]
+        for url in targets:
+            self.check(deadline)
+            if not self.scope.decide(url)[0]:
+                refused.append(url); continue
+            observed={s:self._probe(url,self.identities.get(s) or {},deadline) for s in states_available}
+            for label,sig in observed.items():
+                location=sig.get("location") or ""
+                if location:
+                    absolute=urljoin(url,location)
+                    if not self.scope.decide(absolute)[0]:
+                        refused.append(absolute)
+                        sig["location"]=f"{absolute} [REFUSED: out of scope]"
+            signals=access_signals(observed)
+            for sig in signals:
+                findings.append({"url":url,"source":next((p for p in provenance if True),""),"identity_states":states_available,
+                                 "observed":{k:{kk:vv for kk,vv in v.items() if kk!="error"} for k,v in observed.items()},**sig})
+            rows.append("\t".join([url]+[str(observed[s].get("status",0)) for s in states_available]
+                                   +[str(observed[s].get("length",0)) for s in states_available]
+                                   +[",".join(s["signal"] for s in signals) or "none"]))
+            st.processed+=1
+        self.write_lines(dest,rows)
+        suppressed=[f for f in findings if f["signal"]=="auth_required"]
+        real=[f for f in findings if f["signal"]!="auth_required"]
+        def table(path:Path,header:list[str],rows:list[list[str]])->None:
+            # write_lines() sorts and set-dedupes, which would move a header row and drop repeats.
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text("\n".join(["\t".join(header)]+["\t".join(r) for r in rows])+"\n")
+        table(root/"anomalies.tsv",["url","signal","severity","confidence","false_positive_risk","detail","verify"],
+              [[f["url"],f["signal"],f["severity"],f["confidence"],f["false_positive_risk"],f["detail"],f["verify"]] for f in real])
+        table(root/"suppressed.tsv",["url","signal","reason"],
+              [[f["url"],f["signal"],f["false_positive_risk"]] for f in suppressed])
+        self.write_lines(root/"refused.txt",sorted(set(refused)))
+        atomic_json(root/"findings.json",{"generated_at":now(),"run_id":self.run_id,"target":self.seed,
+            "identity_states":states_available,"targets_considered":len(targets),"targets_probed":st.processed,
+            "candidates":candidates,"candidates_not_probed":len(candidates)-len(targets),
+            "refused_out_of_scope":sorted(set(refused)),"suppressed":suppressed,"candidates_flagged":real,
+            "disclaimer":"candidates only; none of these is a validated vulnerability. Two authenticated identities returning an identical body is the precondition for IDOR, not proof. Confirm the identities are distinct accounts and that the object is meant to be private before reporting."})
+        st.outputs=[str(dest),str(root/"anomalies.tsv"),str(root/"findings.json"),str(root/"suppressed.tsv"),str(root/"refused.txt")]
+        print(f"[access-checks] {st.processed}/{len(targets)} target(s) probed across {len(states_available)} state(s): {len(real)} candidate(s), {len(suppressed)} suppressed, {len(set(refused))} refused out-of-scope",flush=True)
+        if refused: st.failure_reason=f"{len(set(refused))} out-of-scope target(s) or callback(s) refused"
+        if not real: st.status="completed"
     def api_stage(self,st:StageState,deadline:float)->None:
         origins=[o for o in unique_origins(self.inputs(st.id)) if self.log_scope(o)][:self.args.max_hosts]; st.total=len(origins); st.inputs=origins
         if self.args.dry_run: st.processed=st.total; self.write_lines(self.raw/st.id/"normalized.txt",origins); return
