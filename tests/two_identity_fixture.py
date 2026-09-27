@@ -127,6 +127,9 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             "/api/v1/orders/equal-length": self.equal_length,
             "/api/v1/status-only-enforcement": self.status_only_enforcement,
             "/app": self.app_page,
+            "/": self.index,
+            "/admin": self.admin_page,
+            "/api/v1/search": self.search,
         }.get(path)
         if handler is None:
             status, body, headers = _json({"error": "not found"}, 404)
@@ -199,6 +202,61 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             return self._send(*_json(STATUS_ONLY_BODY))
         return self._send(*_json(STATUS_ONLY_BODY, 401))
 
+    def admin_page(self, session, _query):
+        """
+        A real /admin path, so ffuf has something true to find.
+
+        It requires authentication, which is also what makes it worth finding: an ffuf match on a
+        401 is a candidate, and feeding that to access-checks is the handoff this fixture exists
+        to exercise.
+        """
+        if session not in ("A", "B"):
+            return self._send(*_json({"error": "unauthorized"}, 401))
+        return self._send(*_json({"panel": "admin", "tenant": "A"}))
+
+    def search(self, session, query):
+        """
+        Reflects only the parameter names it recognises.
+
+        This is what arjun detects: it probes candidate names and looks for a difference in the
+        response, so a route that ignores unknown parameters is invisible to it and a route that
+        echoes recognised ones is not. Without a route like this the arjun stage legitimately finds
+        nothing, and a test asserting the chain end to end would be asserting a fixture limitation.
+        """
+        if session not in ("A", "B"):
+            return self._send(*_json({"error": "unauthorized"}, 401))
+        # parse_qs maps each name to a LIST of values, so this has to read the first element.
+        # Unpacking a bare list raised ValueError and the route 500'd, which is why arjun correctly
+        # reported nothing: it was probing a broken endpoint.
+        hit = {k: v[0] for k, v in query.items() if k in ("q", "page", "limit")}
+        # A recognised parameter produces a markedly larger body. arjun decides whether a parameter
+        # exists by comparing responses, and a seven-byte delta was not enough for it to conclude
+        # anything; a real search result set is unambiguous, which is also more realistic.
+        results = [{"id": i, "title": f"result-{i} for {hit.get('q','')}"} for i in range(20)] if hit else []
+        return self._send(*_json({"results": results, "count": len(results), "echo": hit}))
+
+    def index(self, _session, _query):
+        """
+        An index that links to every route.
+
+        Without it the crawler has nothing to follow: the fixture serves 404 on any unlisted path,
+        so katana discovers nothing, corpus never populates a params or api partition, and the
+        downstream producers all skip for want of input. A fixture that cannot be crawled cannot
+        exercise the chain it exists to test.
+        """
+        links = "".join(f'<li><a href="{p}">{p}</a></li>' for p in INDEX_LINKS)
+        # The homepage loads its own API. Nothing links these, so only a stage that reads the page
+        # finds them - which is the entire reason web-intelligence exists.
+        boot = ("<script>fetch('/api/v1/profile');fetch('/api/v1/tenants/A/records/101');"
+                "fetch('http://third-party.invalid/beacon');</script>")
+        body = (f"<!doctype html><html><head><title>Fixture Index</title></head><body>"
+                f"<h1>Fixture</h1><ul>{links}</ul>{boot}</body></html>").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def app_page(self, _session, _query):
         """An HTML page whose endpoints are only discoverable by reading it."""
         body = APP_HTML.encode()
@@ -223,6 +281,13 @@ class FixtureHandler(http.server.BaseHTTPRequestHandler):
             return self._send(*_json({"error": "missing to"}, 400))
         return self._send(302, b"", {"Location": target})
 
+
+# A link carrying a query string, so corpus has a parameterised partition to populate, and a
+# homepage that fetches its own API, which is how web-intelligence has anything to extract.
+INDEX_LINKS = ["/api/v1/tenants/A/records/101", "/api/v1/profile",
+               "/api/v1/config/public", "/api/v1/private/dashboard",
+               "/api/v1/search", "/api/v1/search?q=widget", "/app",
+               "/redirect?to=http://169.254.169.254/latest/meta-data/"]
 
 # A page whose interesting content is only reachable by reading it: the endpoints below are
 # fetched from script or posted to, never linked, so a crawler following href/src misses all of

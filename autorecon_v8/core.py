@@ -783,7 +783,13 @@ class Deadline(Exception): pass
 
 class Runner:
     def __init__(self,args:argparse.Namespace):
-        self.args=args; self.host,self.seed=normalize_target(args.target); self.stop=threading.Event(); self.child:subprocess.Popen[str]|None=None
+        self.args=args; self.host,self.seed=normalize_target(args.target)
+        # An explicit non-default port in the target is part of what was asked for. normalize_target
+        # returns the bare hostname, and feeding that to httpx probes the default port instead, so a
+        # target like https://staging.example.com:8443 was silently scanned on 443 and reported
+        # nothing, with no indication that the requested port was never touched.
+        _u=urlsplit(self.seed); _default=443 if _u.scheme=="https" else 80
+        self.probe_target=f"{self.host}:{_u.port}" if _u.port and _u.port!=_default else self.host; self.stop=threading.Event(); self.child:subprocess.Popen[str]|None=None
         self.identities={"anon":{},"a":{},"b":{}}
         if getattr(args,"cookie_file",None): self.identities["a"]=load_credentials(args.cookie_file)
         if getattr(args,"cookie_file_b",None): self.identities["b"]=load_credentials(args.cookie_file_b)
@@ -905,7 +911,7 @@ class Runner:
         discovered=self.read("subdomains")
         resolved=self.read("dnsx")
         hosts=resolved or discovered or [self.host]
-        mapping={"dnsx":discovered+[self.host],"tls":hosts,"httpx":hosts,"screenshots":self.read("httpx"),"ports":hosts,"crawl":self.read("httpx"),"archives":discovered+[self.host],"corpus":self.read("crawl")+self.read("archives"),"javascript":self.read("corpus"),"api-discovery":self.read("httpx") or [self.seed],"web-intelligence":self.read("httpx"),"arjun":self.read("corpus"),"ffuf":self.read("httpx"),"access-checks":self.read("corpus")}
+        mapping={"dnsx":discovered+[self.host],"tls":hosts,"httpx":sorted(set(hosts)|({self.probe_target} if self.probe_target!=self.host else set())),"screenshots":self.read("httpx"),"ports":hosts,"crawl":self.read("httpx"),"archives":discovered+[self.host],"corpus":self.read("crawl")+self.read("archives"),"javascript":self.read("corpus"),"api-discovery":self.read("httpx") or [self.seed],"web-intelligence":self.read("httpx"),"arjun":self.read("corpus"),"ffuf":self.read("httpx"),"access-checks":self.read("corpus")}
         values=[]
         for value in mapping.get(sid,[self.host]):
             if value and value not in values and self.scope.decide(value)[0]: values.append(value)
@@ -1176,6 +1182,9 @@ class Runner:
             return
         cap=int(getattr(self.args,"access_checks_max",0) or ACCESS_CHECKS_DEFAULT_MAX)
         targets=candidates[:cap]; refused_scope=[u for u in candidates[cap:]]
+        # st.total was never set here, so the stage reported "1/0 targets probed" in every run and
+        # the report row looked like a counting bug rather than a completed stage.
+        st.total=len(targets); st.inputs=targets
         if not self.identities.get("a"):
             st.status="skipped"; st.failure_reason="no --cookie-file supplied, so there is no authenticated state to compare against"
             st.outputs=[str(dest)]; self.write_lines(dest,[]); return
@@ -1511,13 +1520,20 @@ class Runner:
         json_out=root/"arjun.json"; text_out=root/"arjun.txt"
         headers_file=root/"arjun-headers.txt"
         identity=self.identities.get("a") or {}
-        self.write_lines(headers_file,[f"{k}: {v}" for k,v in identity.items()])
+        header_lines=[f"{k}: {v}" for k,v in identity.items()]
+        self.write_lines(headers_file,header_lines)
+        # arjun's --headers takes the header text itself, newline-separated for several headers. It
+        # does not take a file path: passing one made arjun send the path as a literal header, so
+        # every probe went out unauthenticated and the stage reported "no parameters" on
+        # authenticated endpoints. Nothing caught it, because the argv looked correct and arjun
+        # exits 0 either way. The file is still written, as evidence of what was sent.
+        header_value="\n".join(header_lines)
         cmd=[tool,"-i",str(input_file),"-o",str(json_out),"-oT",str(text_out),"-q",
              "-t",str(max(1,min(self.args.concurrency,10))),
              "-T",str(max(1,int(self.args.request_timeout)))]
         delay=max(0.0,float(getattr(self.args,"arjun_delay",0) or 0))
         if delay: cmd+=["-d",str(delay)]
-        if identity: cmd+=["--headers",str(headers_file)]
+        if header_value: cmd+=["--headers",header_value]
         if getattr(self.args,"arjun_passive",False): cmd+=["--passive"]
         if getattr(self.args,"arjun_wordlist",None): cmd+=["-w",str(self.args.arjun_wordlist)]
         rc=self.command(st.id,cmd,self.host,deadline,root/"stdout.txt",cwd=root); st.exit_code=rc

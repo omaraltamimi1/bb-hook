@@ -197,6 +197,27 @@ class TestArgv(Harness):
                 self.assertIsNotNone(threads, "arjun was not invoked")
                 self.assertLessEqual(int(threads), int(ceiling))
 
+    def test_arjun_headers_carry_the_credential_text_not_a_path(self):
+        """
+        arjun's --headers takes the header text, not a filename. Passing a path is syntactically
+        fine and arjun still exits 0, so an argv assertion cannot catch it - the only way to know
+        the credential arrived is to observe the server. This asserts the value is inline, and
+        TestArjunCredentialArrives proves the request actually carries it.
+        """
+        run = self.build(["example.com", "--arjun-max", "1"], seed={"corpus": CORPUS_URLS})
+        Path(self.tmp, "a.txt").write_text("Cookie: session=A\n")
+        Path(self.tmp, "b.txt").write_text("Cookie: session=B\n")
+        run.args.cookie_file = str(Path(self.tmp, "a.txt"))
+        run.identities["a"] = {"Cookie": "session=A"}
+        self.run_stage(run, "arjun")
+        cmd = self.last("arjun")
+        value = flag(cmd, "--headers")
+        self.assertIsNotNone(value)
+        self.assertEqual(value, "Cookie: session=A",
+                         f"--headers did not carry the credential text: {value!r}")
+        self.assertFalse(Path(value).exists(),
+                         "--headers was given a path; arjun would send the path as a literal header")
+
     def test_arjun_optional_flags_are_opt_in(self):
         run = self.build(["example.com", "--arjun-max", "1"], seed={"corpus": CORPUS_URLS})
         self.run_stage(run, "arjun")
