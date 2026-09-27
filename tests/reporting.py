@@ -13,12 +13,32 @@ import tempfile
 import unittest
 
 from autorecon_v8.cli import apply_profile_defaults, parser
+import autorecon_v8.core as core_module
 from autorecon_v8.core import Runner, atomic_text
 
 
-def build(tmp, extra=()):
-    args = apply_profile_defaults(parser().parse_args(
-        ["127.0.0.1", "--output-dir", tmp, "--no-kali-share", *extra]))
+_pending: dict = {}
+
+
+def build(tmp, extra=(), mirror=False, mount="/dev/shm"):
+    """A runner over a seeded run directory.
+
+    mirror=False passes --no-kali-share, which is right for tests that only care about result.txt. It
+    is also why the previous share test proved nothing: the mirror was switched off before the mount
+    was ever consulted, so its assertion held whatever the guard did.
+
+    mirror=True points the guard at mount, never at the operator's real share. A test that mirrors to
+    /mnt/KaliShare writes there for real; that happened, and left forty files on a shared evidence
+    directory that is not the test's to touch. /dev/shm is a genuine tmpfs mount, so the guard's
+    mount check is still exercised for real rather than stubbed.
+    """
+    flags = ["127.0.0.1", "--output-dir", tmp, *extra] + ([] if mirror else ["--no-kali-share"])
+    if mirror:
+        import autorecon_v8.core as core
+        real = core.KALI_SHARE_MOUNT
+        core.KALI_SHARE_MOUNT = mount
+        _pending.setdefault("restore_mount", real)
+    args = apply_profile_defaults(parser().parse_args(flags))
     subprocess.run([sys.executable, "-m", "autorecon_v8", "127.0.0.1", "--dry-run",
                     "--only", "httpx", "--output-dir", tmp], capture_output=True, timeout=180)
     args.resume = (pathlib.Path(tmp) / "last").read_text().strip()
@@ -61,6 +81,13 @@ class ResultTxt(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.run = build(self.tmp)
+        share_tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, share_tmp, ignore_errors=True)
+        self.shared = build(share_tmp, mirror=True)
+        # Whatever the tests did under /dev/shm goes with them; the mount is shared, the litter is not.
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", ignore_errors=True)
+        self.addCleanup(setattr, core_module, "KALI_SHARE_MOUNT",
+                        _pending.pop("restore_mount", core_module.KALI_SHARE_MOUNT))
         self.raw = seed(self.run, {
             "dns": ["example.com 3600 IN A 1.2.3.4"],
             "subdomains": ["api.example.com"],
@@ -167,20 +194,125 @@ class ResultTxt(unittest.TestCase):
         self.result()
         self.assertTrue((self.run.work / "result.txt").exists())
 
-    def test_share_mirror_failure_does_not_lose_the_result(self, ):
-        """A missing mount must never fail a run that already has its result on disk."""
+    def patched_mount(self, path):
+        """Point the share guard at a path and restore it afterwards."""
         import autorecon_v8.core as core
-        real = core.KALI_SHARE_RESULTS
-        core.KALI_SHARE_RESULTS = "/proc/definitely-not-writable/share"
-        self.addCleanup(setattr, core, "KALI_SHARE_RESULTS", real)
-        args = apply_profile_defaults(parser().parse_args(["127.0.0.1", "--output-dir", self.tmp]))
-        subprocess.run([sys.executable, "-m", "autorecon_v8", "127.0.0.1", "--dry-run",
-                        "--only", "httpx", "--output-dir", self.tmp], capture_output=True, timeout=180)
-        args.resume = (pathlib.Path(self.tmp) / "last").read_text().strip()
+        real = core.KALI_SHARE_MOUNT
+        core.KALI_SHARE_MOUNT = path
+        self.addCleanup(setattr, core, "KALI_SHARE_MOUNT", real)
+
+    def test_a_writable_mount_is_the_positive_control(self):
+        """/dev/shm is a real, writable mount, so this proves the guard is not just always refusing."""
+        import os
+        if not (os.path.ismount("/dev/shm") and os.access("/dev/shm", os.W_OK)):
+            self.skipTest("no writable mount available on this host")
+        self.patched_mount("/dev/shm")
+        self.shared.generate_reports(0)
+        mirrored = list(pathlib.Path("/dev/shm/autorecon-results").glob("*-*.txt"))
+        self.addCleanup(shutil.rmtree, "/dev/shm/autorecon-results", True)
+        self.assertTrue(mirrored, "a writable mount produced no mirror; the guard refuses unconditionally")
+
+    def test_a_mount_that_is_not_writable_keeps_the_result(self):
+        """A real mount that is not writable must degrade, not fail."""
+        import os
+        if not os.path.ismount("/run"):
+            self.skipTest("no read-only mount available on this host")
+        self.patched_mount("/run")
+        self.shared.generate_reports(0)
+        self.assertTrue((self.shared.work / "result.txt").exists(),
+                        "an unwritable share mount cost the run its result")
+
+    def test_a_plain_directory_is_not_a_mount(self):
+        """Existence is not the test.
+
+        The previous implementation created the path with parents=True, so on a host that never had
+        the share attached it invented /mnt/KaliShare and reported a share that did not exist. Both
+        halves matter: a plain directory is refused, and nothing is created to make the next run
+        agree with this one.
+        """
+        plain = pathlib.Path(self.tmp) / "not-a-mount"
+        plain.mkdir(parents=True)
+        self.patched_mount(str(plain))
+        self.shared.generate_reports(0)
+        self.assertTrue((self.shared.work / "result.txt").exists())
+        self.assertFalse((plain / "autorecon-results").exists(),
+                         "the guard created the results directory inside a non-mount")
+
+    def test_a_missing_mount_is_not_created(self):
+        absent = pathlib.Path(self.tmp) / "never-mounted" / "KaliShare"
+        self.patched_mount(str(absent))
+        self.shared.generate_reports(0)
+        self.assertTrue((self.shared.work / "result.txt").exists())
+        self.assertFalse(absent.exists(), "the guard created the mount point itself")
+
+    def test_the_warning_goes_to_stderr_not_stdout(self):
+        """result.txt is assembled from captured stdout, so a warning on stdout reads like a finding."""
+        import contextlib, io
+        self.patched_mount("/definitely/not/a/mount")
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            self.shared.generate_reports(0)
+        self.assertIn("unavailable", err.getvalue(), "no warning was emitted on stderr")
+        self.assertNotIn("unavailable", out.getvalue(),
+                         "the warning leaked onto stdout, where it is indistinguishable from output")
+
+    def test_resume_command_preserves_the_scope_that_was_authorised(self):
+        """A resume that drops --scope-exclude widens the target, and that is the one failure that
+        cannot be noticed later: the run completes and the artifacts describe a scan wider than the
+        one that was approved."""
+        args = apply_profile_defaults(parser().parse_args([
+            "127.0.0.1", "--output-dir", self.tmp, "--scope-exclude", "dev.example.com",
+            "--strict-scope", "--port-services"]))
+        cmd = Runner(args).resume_command()
+        self.assertIn("--scope-exclude dev.example.com", cmd, "the resume command lost the exclusion rule")
+        self.assertIn("--strict-scope", cmd, "the resume command lost scope enforcement")
+        self.assertIn("--profile", cmd, "the resume command lost the profile")
+
+    def test_resume_command_reparses_to_the_same_run(self):
+        """The command is only useful if pasting it back reproduces the run."""
+        args = apply_profile_defaults(parser().parse_args([
+            "127.0.0.1", "--output-dir", self.tmp, "--profile", "deep",
+            "--scope-exclude", "dev.example.com", "--scope-exclude", "qa.example.com",
+            "--strict-scope", "--port-services", "--crawl-depth", "5", "--rate-limit", "20"]))
+        reparsed = parser().parse_args(Runner(args).resume_command().split()[1:])
+        self.assertEqual(reparsed.scope_exclude, args.scope_exclude)
+        self.assertEqual(reparsed.scope_include, args.scope_include)
+        self.assertEqual(reparsed.profile, args.profile)
+        self.assertEqual(reparsed.crawl_depth, args.crawl_depth)
+        self.assertEqual(reparsed.rate_limit, args.rate_limit)
+        self.assertTrue(reparsed.strict_scope)
+        self.assertTrue(reparsed.port_services)
+
+    def test_the_published_resume_command_carries_the_scope(self):
+        """resume_command() being correct is not the same as the pipeline publishing it.
+
+        Both consumers are asserted, because either one alone can drift: report.json is what a script
+        reads and result.txt is what a human pastes, and a resume that drops --scope-exclude widens
+        the target of the next run without a trace.
+        """
+        import json
+        args = apply_profile_defaults(parser().parse_args([
+            "127.0.0.1", "--output-dir", self.tmp, "--scope-exclude", "dev.example.com",
+            "--strict-scope", "--profile", "deep"]))
         run = Runner(args)
         run.generate_reports(0)
-        self.assertTrue((run.work / "result.txt").exists(),
-                        "an unwritable share mount cost the run its result")
+        published = json.loads((run.work / "report.json").read_text())["resume_command"]
+        self.assertIn("--scope-exclude dev.example.com", published,
+                      "report.json publishes a resume that drops the exclusion rule")
+        self.assertIn("--strict-scope", published, "report.json publishes a resume with no enforcement")
+        text = (run.work / "result.txt").read_text()
+        line = [l for l in text.splitlines() if "Resume:" in l]
+        self.assertTrue(line, "result.txt has no resume line at all")
+        self.assertIn("--scope-exclude dev.example.com", line[0],
+                      "the resume a human would paste drops the exclusion rule")
+
+    def test_resume_command_repeats_no_flag_and_embeds_no_credential(self):
+        args = apply_profile_defaults(parser().parse_args([
+            "127.0.0.1", "--output-dir", self.tmp, "--profile", "deep", "--strict-scope"]))
+        cmd = Runner(args).resume_command()
+        flags = [w for w in cmd.split() if w.startswith("--")]
+        self.assertEqual(len(flags), len(set(flags)), f"a flag is repeated: {cmd}")
+        self.assertNotIn("session=", cmd, "a live credential was inlined into the resume command")
 
 
 if __name__ == "__main__":

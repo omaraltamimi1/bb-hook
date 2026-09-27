@@ -246,7 +246,14 @@ def future_timeout(deadline:float,ceiling:float)->float:
 
 WEB_INTEL_DEFAULT_MAX = 40
 WEB_INTEL_BODY_LIMIT = 1_000_000
-KALI_SHARE_RESULTS = "/mnt/KaliShare/autorecon-results"
+# Only the mount point is configurable, and it is read once at import. A precomputed full path would
+# be a second source of truth that a test patching the mount could not reach, which is precisely how
+# a share check ends up asserting against a string nobody redirected.
+#
+# The override exists because the fixed path is only correct on a Kali workstation. CI, a container
+# and any host without the vboxsf share attached all want the same guarantee without editing code.
+KALI_SHARE_MOUNT = os.environ.get("AUTORECON_KALI_SHARE") or "/mnt/KaliShare"
+KALI_SHARE_SUBDIR = "autorecon-results"
 # Paths worth a human glance in a result file. Deliberately narrow: a result.txt that lists
 # everything is the same as one that lists nothing.
 HIGH_VALUE_URL_RE = re.compile(
@@ -711,6 +718,15 @@ def atomic_json(path: Path, data: Any) -> None:
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
 
+def warn(message: str) -> None:
+    """Diagnostics go to stderr.
+
+    A warning printed on stdout lands in the middle of a stage's output where it reads like a
+    finding, and result.txt is assembled from captured stdout. Degraded-optional behaviour has to be
+    visible and has to stay separable from what the tools actually returned.
+    """
+    print(f"autorecon: warning: {message}",file=sys.stderr,flush=True)
+
 def atomic_text(path: Path, content: str) -> None:
     """Write text atomically.
 
@@ -878,7 +894,7 @@ class Runner:
         except Exception as e: rc=1; self.mark_current("failed",f"{type(e).__name__}: {e}",1); print(f"autorecon: unexpected error: {type(e).__name__}: {e}",file=sys.stderr,flush=True)
         finally:
             self.generate_reports(rc); self.save()
-        if rc: print(f"Resume with: autorecon {self.seed} --resume {self.run_id} --output-dir {self.out}",file=sys.stderr)
+        if rc: print(f"Resume with: {self.resume_command()}",file=sys.stderr,flush=True)
         elif not self.args.keep_temp: shutil.rmtree(self.work/"tmp",ignore_errors=True)
         return rc
     def mark_current(self,status:str,reason:str,rc:int)->None:
@@ -1660,16 +1676,81 @@ class Runner:
         print(f"[report] result.txt -> {run_txt}",flush=True)
         if getattr(self.args,"no_kali_share",False):
             return run_txt
-        share=Path(KALI_SHARE_RESULTS)
-        target=share/f"{re.sub(r'[^A-Za-z0-9._-]','_',self.host)}-{self.run_id}.txt"
+        target=self.kali_share_target()
+        if target is None:
+            # Warned on stderr so it cannot be mistaken for progress, and never raised: a host with
+            # no share must behave exactly like one told not to use it.
+            warn(f"shared evidence mount {KALI_SHARE_MOUNT} unavailable; result is in {run_txt}")
+            return run_txt
         try:
-            share.mkdir(parents=True,exist_ok=True)
+            target.parent.mkdir(parents=True,exist_ok=True)
             atomic_text(target,content)
             print(f"[report] result.txt -> {target}",flush=True)
         except OSError as e:
-            # A missing share mount must never fail a run that already has its result.
-            print(f"[report] shared evidence mount unavailable ({e}); result is in {run_txt}",flush=True)
+            # A missing, full or read-only share must never fail a run that already has its result.
+            warn(f"shared evidence mount unavailable ({e}); result is in {run_txt}")
         return run_txt
+
+    def kali_share_target(self)->Path|None:
+        """
+        Where the evidence copy belongs, or None when the share is not really there.
+
+        Existence is not the test, and that is the whole point. A host that never had the share
+        attached can still have a plain KALI_SHARE_MOUNT directory, and the previous version of this
+        code created one with parents=True, so a bare isdir check would launder this run's own litter
+        into a mount on the next run and report a share that does not exist. The mount point has to be
+        a mount, and only the OS may create it.
+
+        /proc is the honest negative control: always a real mount, never writable, so "mounted but
+        unwritable" is reachable in a test without touching the host.
+        """
+        root=Path(KALI_SHARE_MOUNT)
+        if not root.is_dir() or not os.path.ismount(root) or not os.access(root,os.W_OK):
+            return None
+        return root/KALI_SHARE_SUBDIR/f"{re.sub(r'[^A-Za-z0-9._-]','_',self.host)}-{self.run_id}.txt"
+
+    def resume_command(self)->str:
+        """
+        The exact invocation that continues this run.
+
+        Reconstructed from the arguments rather than hand-written per call site, because a resume
+        that silently drops a flag is worse than no resume at all: the operator pastes it, the run
+        finishes, and the artifacts no longer describe the run that was authorised. Losing
+        --scope-exclude widens the target, losing --profile changes the tool mix, and losing
+        --strict-scope removes the enforcement that was the point of the run. The inline string this
+        replaces carried only the seed, the run id and the output dir, so every one of those was
+        silently dropped.
+
+        Credentials are referenced by path. Inlining them would copy a live session into report.json
+        and into a file on the evidence share.
+        """
+        a=self.args
+        parts=["autorecon",self.seed,"--resume",self.run_id,"--output-dir",str(self.out)]
+        for flag,value in (("--scope-include",getattr(a,"scope_include",None)),
+                           ("--scope-exclude",getattr(a,"scope_exclude",None))):
+            for item in value or []: parts+=[flag,str(item)]
+        for flag in ("--cookie-file","--cookie-file-b"):
+            value=getattr(a,flag.lstrip("-").replace("-","_"),None)
+            if value: parts+=[flag,str(value)]
+        for flag in ("--profile","--arjun-wordlist","--ffuf-wordlist"):
+            value=getattr(a,flag.lstrip("-").replace("-","_"),None)
+            if value: parts+=[flag,str(value)]
+        # Emitted when set, never when 0: the limits are 0-means-unset, and passing 0 back to a flag
+        # that means "no cap" would be indistinguishable from capping the run at nothing.
+        for flag in ("--rate-limit","--request-timeout","--tool-timeout","--stage-timeout",
+                     "--global-timeout","--crawl-depth","--max-hosts","--concurrency","--kill-grace",
+                     "--heartbeat","--access-checks-max","--arjun-max","--arjun-delay","--web-intel-max",
+                     "--ffuf-max-hosts","--ffuf-max-time","--ffuf-threads","--ffuf-delay",
+                     "--ffuf-recursion-depth"):
+            value=getattr(a,flag.lstrip("-").replace("-","_"),None)
+            if value: parts+=[flag,str(value)]
+        for flag in ("--strict-scope","--strict-stages","--active","--passive","--port-services",
+                     "--arjun-passive","--keep-temp","--auto","--graphql-introspection"):
+            if getattr(a,flag.lstrip("-").replace("-","_"),False): parts.append(flag)
+        for flag in ("--ffuf-recursion","--dry-run"):
+            if getattr(a,flag.lstrip("-").replace("-","_"),False): parts.append(flag)
+        if getattr(a,"restart_stage",None): parts+=["--restart-stage",a.restart_stage]
+        return " ".join(parts)
 
     def hunt_queue(self,limit:int=HUNT_LIMIT)->list[dict[str,str]]:
         """
@@ -1730,7 +1811,7 @@ class Runner:
         return items[:limit]
 
     def generate_reports(self,rc:int)->None:
-        self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=f"autorecon {self.seed} --resume {self.run_id} --output-dir {self.out}"
+        self.work.mkdir(parents=True,exist_ok=True); stages=[dataclasses.asdict(self.stages[s]) for s in STAGE_IDS]; resume=self.resume_command()
         hunt=self.hunt_queue()
         report={"version":"8.0.0","run_id":self.run_id,"target":self.seed,"status":"completed" if rc==0 else "partial","started_at":self.started_at,"generated_at":now(),"resume_command":resume,"evidence":{"raw":str(self.raw),"commands":str(self.command_log),"scope":str(self.scope_log)},"hunt_queue":hunt,"vulnerability_claims":[],"stages":stages}
         atomic_json(self.work/"report.json",report)
