@@ -35,8 +35,9 @@ from autorecon_v8.core import (
     Runner, Scope, arjun_parse, ffuf_results, naabu_open_ports, nmap_services,
 )
 
-# Stage id -> Runner method. "access-checks" is the only id that is not a valid identifier.
-STAGE_METHODS = {"access-checks": "access_checks_stage"}
+# Stage id -> Runner method. Two ids are not valid identifier transformations of their method:
+# "access-checks" contains a dash, and "screenshots" is plural while the method is singular.
+STAGE_METHODS = {"access-checks": "access_checks_stage", "screenshots": "screenshot_stage"}
 
 
 def method_for(stage_id):
@@ -280,6 +281,92 @@ class TestArgv(Harness):
             self.assertNotIn("nmap", cmd[0], "nmap ran without --port-services")
 
 
+class TestScreenshots(Harness):
+    """httpx drives a browser per thread, so its defaults are unsafe and are all overridden."""
+
+    def run_screens(self, argv, browser="chromium", png=False):
+        """Run the stage with httpx stubbed. browser=None simulates a host with no local browser."""
+        import autorecon_v8.core as core
+        real_which = core.shutil.which
+        real_command = Runner.command
+
+        def which(name, *a, **k):
+            if name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+                return f"/usr/bin/{name}" if name == browser else None
+            return real_which(name, *a, **k)
+
+        def spy(runner_self, sid, cmd, host, deadline, out, cwd=None):
+            self.captured.append(list(cmd))
+            target = Path(out)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if png:
+                (target.parent / "shot-0001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            target.write_text("")
+            return 0
+
+        core.shutil.which = which
+        Runner.command = spy
+        self.addCleanup(setattr, core.shutil, "which", real_which)
+        self.addCleanup(setattr, Runner, "command", real_command)
+        run = self.build(argv, seed={"httpx": ["https://example.com"]})
+        self.captured = []
+        st = run.stages["screenshots"]
+        st.status = "pending"
+        run.screenshot_stage(st, run.global_deadline)
+        return run, st
+
+    def test_httpx_argv_is_bounded_and_uses_system_chrome(self):
+        run, st = self.run_screens(["example.com", "--concurrency", "3", "--request-timeout", "1"])
+        cmd = self.last("httpx")
+        self.assertEqual(flag(cmd, "-l"), str(Path(run.raw) / "screenshots" / "inputs.txt"))
+        self.assertIn("-screenshot", cmd)
+        self.assertIn("-nc", cmd)
+        self.assertIn("-system-chrome", cmd)
+        self.assertNotIn("-no-screenshot-full-page", cmd,
+                         "a local browser exists, so the fallback must not be used")
+        # httpx defaults to 50 threads and each may drive a browser
+        self.assertEqual(flag(cmd, "-t"), "3")
+        # request-timeout 1 would ask for a 1s screenshot budget; floored at 5
+        self.assertEqual(flag(cmd, "-screenshot-timeout"), "5")
+
+    def test_thread_clamp_under_extreme_input(self):
+        for concurrency, expected in (("1", "1"), ("10", "10"), ("50", "10"), ("5000", "10")):
+            with self.subTest(concurrency=concurrency):
+                run, st = self.run_screens(["example.com", "--concurrency", concurrency])
+                self.assertEqual(flag(self.last("httpx"), "-t"), expected)
+
+    def test_falls_back_when_no_local_browser_exists(self):
+        run, st = self.run_screens(["example.com"], browser=None)
+        cmd = self.last("httpx")
+        self.assertNotIn("-system-chrome", cmd)
+        self.assertIn("-no-screenshot-full-page", cmd,
+                      "without a local browser, httpx must not try to fetch one mid-run")
+
+    def test_no_capture_is_reported_rather_than_a_bare_success(self):
+        run, st = self.run_screens(["example.com"], browser=None, png=False)
+        self.assertEqual(st.status, "skipped")
+        self.assertIn("no screenshot captured", st.failure_reason)
+        self.assertIn("no local chrome/chromium", st.failure_reason)
+
+    def test_captured_images_are_listed_and_counted(self):
+        run, st = self.run_screens(["example.com"], png=True)
+        listed = (Path(run.raw) / "screenshots" / "normalized.txt").read_text()
+        self.assertIn(".png", listed)
+        self.assertEqual(st.processed, 1)
+        self.assertNotEqual(st.status, "skipped")
+
+    def test_dry_run_makes_no_tool_call(self):
+        run = self.build(["example.com", "--dry-run"], seed={"httpx": ["https://example.com"]})
+        self.run_stage(run, "screenshots")
+        self.assertEqual(self.captured, [], "dry-run invoked httpx")
+
+    def test_no_origins_skips_with_a_reason(self):
+        run = self.build(["example.com"], seed={"httpx": []})
+        st = self.run_stage(run, "screenshots")
+        self.assertEqual(st.status, "skipped")
+        self.assertIn("no live HTTP origins", st.failure_reason)
+
+
 class TestDecoupledContracts(Harness):
     """read_partition and its consumers must survive absent, empty and populated producers."""
 
@@ -493,7 +580,7 @@ class TestScopeEnforcement(Harness):
 class TestStateReset(Harness):
     """execute() must not let a stale failure_reason survive, and must never wedge a stage."""
 
-    NEW_STAGES = ["corpus", "crawl", "javascript", "arjun", "ffuf", "access-checks", "ports"]
+    NEW_STAGES = ["corpus", "crawl", "javascript", "arjun", "ffuf", "access-checks", "ports", "screenshots"]
 
     def test_execute_clears_failure_reason_and_exit_code_on_entry(self):
         for stage in self.NEW_STAGES:
@@ -525,6 +612,7 @@ class TestStateReset(Harness):
         "ffuf": {"corpus": ("origins.txt", ["https://ok.example.com"])},
         "access-checks": {"corpus": ("params.txt", ["https://ok.example.com/a?id=1"])},
         "ports": {"dnsx": ["example.com"]},
+        "screenshots": {"httpx": ["https://ok.example.com"]},
     }
 
     def test_unexpected_exception_does_not_wedge_a_stage_in_running(self):

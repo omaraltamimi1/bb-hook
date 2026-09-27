@@ -36,7 +36,7 @@ DEPS.update({"screenshots":["httpx"],"ports":["dnsx"],"crawl":["httpx"],"archive
 # Stage removed from the graph but still named by artifacts written by older runs. Keeping the
 # tombstone means a resume of such a run reports it as retired instead of raising KeyError.
 DEPRECATED_STAGES = {"nmap": "folded into the ports stage; run it with --port-services"}
-STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "arjun", "ffuf", "access-checks", "report"}
+STAGE_IMPLEMENTED = {"dns", "subdomains", "dnsx", "tls", "httpx", "screenshots", "ports", "archives", "corpus", "crawl", "api-discovery", "javascript", "arjun", "ffuf", "access-checks", "report"}
 UNIMPLEMENTED = tuple(s for s in STAGE_IDS if s not in STAGE_IMPLEMENTED)
 assert not (STAGE_IMPLEMENTED & set(UNIMPLEMENTED)) and set(STAGE_IMPLEMENTED) | set(UNIMPLEMENTED) == set(STAGE_IDS), "stage classification does not partition STAGE_IDS"
 
@@ -666,6 +666,7 @@ class Runner:
             elif st.id=="arjun": self.arjun_stage(st,deadline)
             elif st.id=="ports": self.ports_stage(st,deadline)
             elif st.id=="ffuf": self.ffuf_stage(st,deadline)
+            elif st.id=="screenshots": self.screenshot_stage(st,deadline)
             else: self.generic_stage(st,deadline)
             if st.status=="running": st.status="completed"; st.exit_code=0; st.resume="completed artifacts reusable"
         except Deadline: st.status="partial" if st.processed else "failed"; st.exit_code=124; st.failure_reason="stage deadline expired"; st.resume="retry remaining units"
@@ -969,6 +970,44 @@ class Runner:
         print(f"[access-checks] {st.processed}/{len(targets)} target(s) probed across {len(states_available)} state(s): {len(real)} candidate(s), {len(suppressed)} suppressed, {len(set(refused))} refused out-of-scope",flush=True)
         if refused: st.failure_reason=f"{len(set(refused))} out-of-scope target(s) or callback(s) refused"
         if not real: st.status="completed"
+    def screenshot_stage(self,st:StageState,deadline:float)->None:
+        """Headless screenshot capture via httpx, which is how the other HTTP stages run.
+
+        httpx needs a rendering engine for -screenshot. -system-chrome reuses a locally installed
+        browser, which avoids shipping one; where no local browser exists httpx would try to
+        download one mid-run, so -no-screenshot-full-page is used instead and the missing browser
+        is reported rather than silently producing nothing.
+        """
+        values=[v for v in self.inputs(st.id) if v]; root=self.raw/st.id; dest=root/"normalized.txt"
+        st.total=len(values); st.inputs=values; st.outputs=[str(dest)]
+        if not values:
+            st.status="skipped"; st.failure_reason="no live HTTP origins from httpx"; self.write_lines(dest,[]); return
+        tool=shutil.which("httpx")
+        if not tool:
+            st.status="skipped"; st.failure_reason="missing external tool: httpx"; self.write_lines(dest,[]); return
+        if self.args.dry_run:
+            self.write_lines(dest,values); st.processed=st.total; return
+        root.mkdir(parents=True,exist_ok=True)
+        input_file=root/"inputs.txt"; self.write_lines(input_file,values)
+        browser=next((c for c in ("chromium","chromium-browser","google-chrome","google-chrome-stable") if shutil.which(c)),None)
+        shot_timeout=max(5,int(self.args.request_timeout))
+        # -t is clamped: httpx defaults to 50 threads, and every one of them may drive a browser.
+        cmd=[tool,"-silent","-l",str(input_file),"-screenshot","-screenshot-timeout",str(shot_timeout),
+             "-t",str(max(1,min(self.args.concurrency,10))),"-nc"]
+        if browser: cmd+=["-system-chrome"]
+        else: cmd+=["-no-screenshot-full-page"]
+        stdout=root/"stdout.txt"; rc=self.command(st.id,cmd,self.host,deadline,stdout,cwd=root); st.exit_code=rc
+        shots=sorted(str(p) for p in root.rglob("*.png"))
+        if not shots:
+            st.status="skipped"; st.processed=0
+            st.failure_reason="no screenshot captured"+("" if browser else " and no local chrome/chromium found for -system-chrome")
+            if rc: st.failure_reason+=f"; httpx exited {rc}"
+            self.write_lines(dest,[]); return
+        self.write_lines(dest,shots); st.outputs=[str(dest)]+[str(p) for p in shots[:200]]
+        st.processed=len(shots)
+        print(f"[screenshots] captured {len(shots)} image(s) under {root}",flush=True)
+        if rc: st.status="partial"; st.failure_reason=f"httpx exited {rc} but {len(shots)} image(s) were captured"
+
     def ports_stage(self,st:StageState,deadline:float)->None:
         hosts=self.inputs(st.id); st.total=len(hosts); st.inputs=[str(x) for x in hosts]
         root=self.raw/st.id; dest=root/"normalized.txt"; st.outputs=[str(dest)]
