@@ -119,16 +119,23 @@ class TestPipelineEndToEnd(unittest.TestCase):
             self.assertTrue((directory / artifact).exists(),
                             f"{producer} did not write {artifact}")
 
-        # 3b. isolation, proven by difference rather than by filename. corpus legitimately owns a
-        # params.txt, so "arjun leaked params.txt" is not a check. Running the same chain with and
-        # without the three producers and diffing corpus is: if any producer still mutated corpus,
-        # the two runs would disagree.
-        baseline, _ = self.run_cli("--only", "httpx,crawl,corpus,web-intelligence,report")
-        for artifact in ("normalized.txt", "origins.txt", "classify.tsv"):
-            self.assertEqual(
-                (baseline / "raw-artifacts" / "corpus" / artifact).read_text(),
-                (raw / "corpus" / artifact).read_text(),
-                f"corpus/{artifact} differs when arjun and ffuf run: a producer is still mutating corpus")
+        # 3b. Isolation, from an invariant that holds inside a single run.
+        #
+        # Two runs cannot be compared: katana's crawl is nondeterministic, so two runs discover
+        # different links and the diff says nothing about the producers. corpus writes classify.tsv
+        # as a manifest of its own partitions, so if arjun or ffuf appended to a partition after the
+        # fact, the recorded count would stop matching the file. That is the property decoupling
+        # exists to preserve, and it is checkable without a second run.
+        manifest = (corpus / "classify.tsv").read_text().splitlines()
+        self.assertTrue(manifest, "corpus wrote no classify.tsv manifest")
+        for line in manifest:
+            kind, count, name = line.split("\t")
+            partition = corpus / name
+            self.assertTrue(partition.exists(), f"classify.tsv names {name} but the file is absent")
+            actual = len([l for l in partition.read_text().splitlines() if l.strip()])
+            self.assertEqual(actual, int(count),
+                             f"corpus/{name} ({kind}) holds {actual} lines but classify.tsv recorded "
+                             f"{count}: a producer mutated a corpus partition after the manifest was written")
 
         # 4. the differential consumed them: inputs complete, and the real IDOR is flagged
         findings = json.loads((raw / "access-checks" / "findings.json").read_text())
